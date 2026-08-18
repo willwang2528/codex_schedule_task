@@ -1,0 +1,26 @@
+id: replace-me
+name: Replace Me
+
+enabled: false
+
+schedule:
+  timezone: Asia/Shanghai
+  cron: "0 8 * * *"
+
+workflow:
+  type: codex
+
+task_prompt:
+  path: tasks/_template/TASK.md
+
+delivery:
+  type: feishu
+  enabled: false
+
+output:
+  save_local: true
+  directory: outputs/_template
+
+state:
+  enabled: true
+  path: state/_template.json
