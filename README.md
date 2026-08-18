@@ -43,7 +43,17 @@ Configure Feishu only in the process environment:
 cp config/env.example config/.env
 ```
 
-Do not commit `config/.env`. Export those values into the environment used by the Codex scheduled task before delivery.
+Populate the ignored local `config/.env` file or export the values in the process environment. Never commit `config/.env`.
+
+This repository uses namespaced Feishu variables to avoid collisions with other local projects:
+
+```text
+FEISHU_APP_ID_SCHEDULE_TASK
+FEISHU_APP_SECRET_SCHEDULE_TASK
+FEISHU_CHAT_ID_SCHEDULE_TASK
+```
+
+The Feishu module automatically loads these keys from `config/.env`; an explicitly exported process variable takes precedence over the file value.
 
 ## Add a task
 

@@ -61,7 +61,8 @@ Never search for exactly the requested Top K and send those results without inde
 - Use environment variables for credentials.
 - Never commit secrets, tokens, cookies, private keys, or real `.env` files.
 - Never place credentials in `TASK.md`, `README.md`, outputs, or logs.
-- Never print `FEISHU_APP_SECRET` or a complete access token.
+- Feishu credentials for this repository must use the names `FEISHU_APP_ID_SCHEDULE_TASK`, `FEISHU_APP_SECRET_SCHEDULE_TASK`, and `FEISHU_CHAT_ID_SCHEDULE_TASK`. Do not fall back to unsuffixed names because other local projects may use them.
+- Never print `FEISHU_APP_SECRET_SCHEDULE_TASK` or a complete access token.
 - Do not add an `OPENAI_API_KEY` dependency. Use the current Codex/ChatGPT runtime and available tools.
 
 ## Delivery authorization

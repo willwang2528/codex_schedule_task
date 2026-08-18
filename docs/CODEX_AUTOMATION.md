@@ -61,12 +61,14 @@ The scheduled prompt intentionally contains paths, not the long research prompt.
 For Feishu delivery, make these values available to the desktop app process without committing them:
 
 ```text
-FEISHU_APP_ID
-FEISHU_APP_SECRET
-FEISHU_CHAT_ID
+FEISHU_APP_ID_SCHEDULE_TASK
+FEISHU_APP_SECRET_SCHEDULE_TASK
+FEISHU_CHAT_ID_SCHEDULE_TASK
 ```
 
-When they are absent, research and local output can still succeed and delivery is `skipped`.
+The Feishu module automatically loads these namespaced keys from the ignored local file `config/.env`. Explicit process environment values take precedence. Unsuffixed Feishu variable names are intentionally unsupported to avoid collisions with other projects.
+
+When the three namespaced values are absent, research and local output can still succeed and delivery is `skipped`.
 
 ## Operations
 

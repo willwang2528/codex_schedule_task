@@ -16,10 +16,52 @@ from typing import Any, Dict, Optional
 
 AUTH_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 MESSAGE_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
+APP_ID_ENV_KEY = "FEISHU_APP_ID_SCHEDULE_TASK"
+APP_SECRET_ENV_KEY = "FEISHU_APP_SECRET_SCHEDULE_TASK"
+CHAT_ID_ENV_KEY = "FEISHU_CHAT_ID_SCHEDULE_TASK"
+FEISHU_ENV_KEYS = (
+    APP_ID_ENV_KEY,
+    APP_SECRET_ENV_KEY,
+    CHAT_ID_ENV_KEY,
+)
 
 
 class FeishuDeliveryError(RuntimeError):
     """A sanitized Feishu API or configuration error."""
+
+
+def load_local_feishu_env(path: Optional[Path] = None) -> bool:
+    """Load namespaced Feishu values from config/.env without overriding exports."""
+
+    env_path = path or Path(__file__).resolve().parents[1] / "config" / ".env"
+    if not env_path.is_file():
+        return False
+
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise FeishuDeliveryError(
+            f"cannot read local Feishu environment file: {env_path}"
+        ) from exc
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise FeishuDeliveryError(
+                f"invalid config/.env entry at line {line_number}"
+            )
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if key not in FEISHU_ENV_KEYS:
+            continue
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key not in os.environ and value:
+            os.environ[key] = value
+    return True
 
 
 def _request_json(
@@ -82,15 +124,17 @@ def send_message(
     title: str = "Automation Hub",
     chat_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    app_id = os.environ.get("FEISHU_APP_ID", "")
-    app_secret = os.environ.get("FEISHU_APP_SECRET", "")
-    resolved_chat_id = chat_id or os.environ.get("FEISHU_CHAT_ID", "")
+    if not all(os.environ.get(key) for key in FEISHU_ENV_KEYS):
+        load_local_feishu_env()
+    app_id = os.environ.get(APP_ID_ENV_KEY, "")
+    app_secret = os.environ.get(APP_SECRET_ENV_KEY, "")
+    resolved_chat_id = chat_id or os.environ.get(CHAT_ID_ENV_KEY, "")
     missing = [
         key
         for key, value in (
-            ("FEISHU_APP_ID", app_id),
-            ("FEISHU_APP_SECRET", app_secret),
-            ("FEISHU_CHAT_ID", resolved_chat_id),
+            (APP_ID_ENV_KEY, app_id),
+            (APP_SECRET_ENV_KEY, app_secret),
+            (CHAT_ID_ENV_KEY, resolved_chat_id),
         )
         if not value
     ]

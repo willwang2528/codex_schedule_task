@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from feishu_send import FeishuDeliveryError, send_message
+from feishu_send import (
+    FEISHU_ENV_KEYS,
+    FeishuDeliveryError,
+    load_local_feishu_env,
+    send_message,
+)
 
 
 NETWORK_TARGETS = (
@@ -61,15 +66,19 @@ def main() -> int:
 
     feishu_status = "skipped"
     delivery_error: Optional[str] = None
+    if delivery_enabled and not all(os.environ.get(key) for key in FEISHU_ENV_KEYS):
+        try:
+            load_local_feishu_env()
+        except FeishuDeliveryError as exc:
+            feishu_status = "failed"
+            delivery_error = str(exc)
     feishu_values = [
         os.environ.get(key, "")
-        for key in (
-            "FEISHU_APP_ID",
-            "FEISHU_APP_SECRET",
-            "FEISHU_CHAT_ID",
-        )
+        for key in FEISHU_ENV_KEYS
     ]
-    if delivery_enabled and all(feishu_values):
+    if delivery_error is not None:
+        pass
+    elif delivery_enabled and all(feishu_values):
         message = "\n".join(
             (
                 "Automation Hub Smoke Test",

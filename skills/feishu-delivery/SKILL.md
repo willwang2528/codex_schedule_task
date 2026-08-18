@@ -10,10 +10,10 @@ Use this workflow only after verification, ranking, and local output persistence
 ## Preconditions
 
 - The task enables Feishu delivery.
-- `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, and `FEISHU_CHAT_ID` are available in the process environment.
+- `FEISHU_APP_ID_SCHEDULE_TASK`, `FEISHU_APP_SECRET_SCHEDULE_TASK`, and `FEISHU_CHAT_ID_SCHEDULE_TASK` are available in the process environment or the ignored local file `config/.env`.
 - The exact final output has already been saved locally.
 
-If all variables are absent, mark delivery `skipped`. If only some are present, mark it `failed` and report incomplete configuration without printing values.
+Explicit process environment values take precedence over `config/.env`. Do not read unsuffixed Feishu variables. If all namespaced variables are absent, mark delivery `skipped`. If only some are present, mark it `failed` and report incomplete configuration without printing values.
 
 ## Delivery
 
