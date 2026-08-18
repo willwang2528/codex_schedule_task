@@ -36,7 +36,12 @@
       "update_reason": null
     }
   },
-  "last_run": "2026-08-19T00:13:35+08:00",
+  "last_run": "2026-08-19T01:24:48+08:00",
+  "last_delivery": {
+    "status": "ok",
+    "at": "2026-08-19T01:24:48+08:00",
+    "output_path": "outputs/agent-memory-daily/2026-08-19.md"
+  },
   "baseline": {
     "date": "2026-08-19",
     "candidate_count": 17,
