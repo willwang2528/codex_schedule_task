@@ -1,0 +1,27 @@
+id: smoke-test
+name: Automation Hub Smoke Test
+
+enabled: false
+
+schedule:
+  timezone: Asia/Shanghai
+  cron: "0 9 * * *"
+
+workflow:
+  type: deterministic
+  deterministic_script: scripts/smoke_test.py
+
+task_prompt:
+  path: tasks/smoke-test/TASK.md
+
+delivery:
+  type: feishu
+  enabled: true
+
+output:
+  save_local: true
+  directory: outputs/smoke-test
+
+state:
+  enabled: false
+  path: state/smoke-test.json
