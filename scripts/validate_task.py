@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from feishu_cards import PRESENTATION_RULES
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -21,6 +24,24 @@ REQUIRED_SECTIONS = (
     "output",
     "state",
 )
+TRIGGER_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+ALLOWED_DELIVERY_TYPES = {"feishu", "none"}
+ALLOWED_DELIVERY_POLICIES = {"always", "conditional", "never"}
+ALLOWED_DELIVERY_PRESENTATIONS = {"post", *PRESENTATION_RULES}
+ALLOWED_REASONING_EFFORTS = {
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+}
+SECRET_KEY_MARKERS = ("secret", "password", "access_token", "private_key")
+TASK_CHAT_ID_ENV_PATTERN = re.compile(
+    r"^FEISHU_CHAT_ID_[A-Z0-9_]+_SCHEDULE_TASK$"
+)
 
 
 class TaskConfigError(ValueError):
@@ -31,6 +52,11 @@ def _parse_scalar(raw_value: str) -> Any:
     value = raw_value.strip()
     if not value:
         return ""
+    if value.startswith("[") or value.startswith("{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise TaskConfigError(f"invalid inline JSON value: {value}") from exc
     if value.startswith(('"', "'")):
         if value.startswith('"'):
             try:
@@ -116,6 +142,91 @@ def _nested(config: Dict[str, Any], section: str, key: str) -> Any:
     return value.get(key)
 
 
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _nonnegative_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def _iter_values(value: Any, prefix: str = "") -> Iterable[Tuple[str, Any]]:
+    if not isinstance(value, dict):
+        return
+    for key, child in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        yield path, child
+        if isinstance(child, dict):
+            yield from _iter_values(child, path)
+
+
+def schedule_triggers(config: Dict[str, Any]) -> List[str]:
+    """Return normalized HH:MM triggers from current or legacy fields."""
+
+    schedule = config.get("schedule")
+    if not isinstance(schedule, dict):
+        return []
+    triggers = schedule.get("triggers")
+    if isinstance(triggers, list):
+        return [str(value) for value in triggers]
+    cron = schedule.get("cron")
+    if not isinstance(cron, str):
+        return []
+    fields = cron.split()
+    if len(fields) != 5:
+        return []
+    minute, hour = fields[0], fields[1]
+    if minute.isdigit() and hour.isdigit():
+        return [f"{int(hour):02d}:{int(minute):02d}"]
+    return []
+
+
+def discover_task_configs(repo_root: Path) -> List[Path]:
+    """Discover concrete task definitions in deterministic order."""
+
+    tasks_root = repo_root / "tasks"
+    if not tasks_root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in tasks_root.glob("*/task.yaml")
+        if path.parent.name != "_template"
+    )
+
+
+def validate_all_tasks(repo_root: Path) -> List[Dict[str, Any]]:
+    """Validate every task and enforce repository-wide unique ids."""
+
+    reports: List[Dict[str, Any]] = []
+    ids: Dict[str, str] = {}
+    for config_path in discover_task_configs(repo_root):
+        try:
+            config = load_task_config(config_path)
+            errors = validate_task_config(config, config_path, repo_root)
+        except TaskConfigError as exc:
+            config = {}
+            errors = [str(exc)]
+        task_id = config.get("id")
+        if isinstance(task_id, str):
+            if task_id in ids:
+                errors.append(f"duplicate task id also used by {ids[task_id]}")
+            else:
+                ids[task_id] = str(config_path.relative_to(repo_root))
+        reports.append(
+            {
+                "task": task_id,
+                "config": str(config_path.relative_to(repo_root)),
+                "valid": not errors,
+                "errors": errors,
+            }
+        )
+    return reports
+
+
 def validate_task_config(
     config: Dict[str, Any], config_path: Path, repo_root: Path
 ) -> List[str]:
@@ -141,6 +252,7 @@ def validate_task_config(
 
     timezone_name = _nested(config, "schedule", "timezone")
     cron = _nested(config, "schedule", "cron")
+    triggers = _nested(config, "schedule", "triggers")
     if not isinstance(timezone_name, str) or not timezone_name.strip():
         errors.append("schedule.timezone must be a non-empty string")
     else:
@@ -148,8 +260,22 @@ def validate_task_config(
             ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
             errors.append("schedule.timezone must be a valid IANA timezone")
-    if not isinstance(cron, str) or len(cron.split()) != 5:
-        errors.append("schedule.cron must be a quoted five-field cron string")
+    if triggers is None:
+        if not isinstance(cron, str) or len(cron.split()) != 5:
+            errors.append(
+                "schedule must define triggers or a quoted five-field cron string"
+            )
+    elif not isinstance(triggers, list) or not triggers:
+        errors.append("schedule.triggers must be a non-empty inline list")
+    else:
+        normalized = [str(value) for value in triggers]
+        if any(not TRIGGER_PATTERN.fullmatch(value) for value in normalized):
+            errors.append("schedule.triggers values must use HH:MM (24-hour time)")
+        if len(normalized) != len(set(normalized)):
+            errors.append("schedule.triggers must not contain duplicates")
+    catch_up_minutes = _nested(config, "schedule", "catch_up_minutes")
+    if catch_up_minutes is not None and not _positive_int(catch_up_minutes):
+        errors.append("schedule.catch_up_minutes must be a positive integer")
 
     workflow_type = _nested(config, "workflow", "type")
     if not isinstance(workflow_type, str) or not workflow_type.strip():
@@ -189,8 +315,25 @@ def validate_task_config(
                     f"workflow.deterministic_script does not exist: {deterministic_script}"
                 )
 
+    context_script = _nested(config, "workflow", "context_script")
+    if context_script is not None:
+        if not isinstance(context_script, str) or not context_script.strip():
+            errors.append("workflow.context_script must be a relative path")
+        else:
+            candidate = (repo_root / context_script).resolve()
+            tasks_root = (repo_root / "tasks").resolve()
+            if not _is_relative_to(candidate, tasks_root):
+                errors.append("workflow.context_script must stay inside tasks/")
+            elif not candidate.is_file():
+                errors.append(
+                    f"workflow.context_script does not exist: {context_script}"
+                )
+    context_timeout = _nested(config, "workflow", "context_timeout_seconds")
+    if context_timeout is not None and not _positive_int(context_timeout):
+        errors.append("workflow.context_timeout_seconds must be a positive integer")
+
     delivery_type = _nested(config, "delivery", "type")
-    if delivery_type not in {"feishu", "none"}:
+    if delivery_type not in ALLOWED_DELIVERY_TYPES:
         errors.append("delivery.type must be 'feishu' or 'none'")
     if not isinstance(_nested(config, "delivery", "enabled"), bool):
         errors.append("delivery.enabled must be true or false")
@@ -198,6 +341,110 @@ def validate_task_config(
         errors.append("output.save_local must be true or false")
     if not isinstance(_nested(config, "state", "enabled"), bool):
         errors.append("state.enabled must be true or false")
+
+    delivery_policy = _nested(config, "delivery", "policy")
+    if delivery_policy is not None and delivery_policy not in ALLOWED_DELIVERY_POLICIES:
+        errors.append("delivery.policy must be always, conditional, or never")
+    delivery_target = _nested(config, "delivery", "target")
+    if delivery_target is not None and delivery_target != "configured_chat":
+        errors.append("delivery.target must be configured_chat")
+    delivery_chat_id_env = _nested(config, "delivery", "chat_id_env")
+    if delivery_chat_id_env is not None and (
+        not isinstance(delivery_chat_id_env, str)
+        or not TASK_CHAT_ID_ENV_PATTERN.fullmatch(delivery_chat_id_env)
+    ):
+        errors.append(
+            "delivery.chat_id_env must use FEISHU_CHAT_ID_<TASK>_SCHEDULE_TASK"
+        )
+    notification_triggers = _nested(config, "delivery", "notification_triggers")
+    if notification_triggers is not None:
+        if not isinstance(notification_triggers, list) or not notification_triggers:
+            errors.append("delivery.notification_triggers must be a non-empty inline list")
+        else:
+            normalized_notification_triggers = [
+                str(value) for value in notification_triggers
+            ]
+            if any(
+                not TRIGGER_PATTERN.fullmatch(value)
+                for value in normalized_notification_triggers
+            ):
+                errors.append(
+                    "delivery.notification_triggers values must use HH:MM (24-hour time)"
+                )
+            if len(normalized_notification_triggers) != len(
+                set(normalized_notification_triggers)
+            ):
+                errors.append("delivery.notification_triggers must not contain duplicates")
+            schedule_trigger_values = set(schedule_triggers(config))
+            unknown_notification_triggers = sorted(
+                set(normalized_notification_triggers).difference(schedule_trigger_values)
+            )
+            if unknown_notification_triggers:
+                errors.append(
+                    "delivery.notification_triggers must be a subset of schedule.triggers: "
+                    + ", ".join(unknown_notification_triggers)
+                )
+    delivery_retry = _nested(config, "delivery", "retry_attempts")
+    if delivery_retry is not None and not _positive_int(delivery_retry):
+        errors.append("delivery.retry_attempts must be a positive integer")
+    delivery_presentation = _nested(config, "delivery", "presentation")
+    if (
+        delivery_presentation is not None
+        and delivery_presentation not in ALLOWED_DELIVERY_PRESENTATIONS
+    ):
+        errors.append("delivery.presentation is invalid")
+
+    execution = config.get("execution")
+    if execution is not None and not isinstance(execution, dict):
+        errors.append("execution must be a mapping")
+    elif isinstance(execution, dict):
+        timeout_seconds = execution.get("timeout_seconds")
+        if timeout_seconds is not None and not _positive_int(timeout_seconds):
+            errors.append("execution.timeout_seconds must be a positive integer")
+        retry_attempts = execution.get("retry_attempts")
+        if retry_attempts is not None and not _positive_int(retry_attempts):
+            errors.append("execution.retry_attempts must be a positive integer")
+        retry_backoff = execution.get("retry_backoff_seconds")
+        if retry_backoff is not None and not _nonnegative_number(retry_backoff):
+            errors.append(
+                "execution.retry_backoff_seconds must be a non-negative number"
+            )
+        model = execution.get("model")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            errors.append("execution.model must be a non-empty string")
+        reasoning_effort = execution.get("reasoning_effort")
+        if (
+            reasoning_effort is not None
+            and reasoning_effort not in ALLOWED_REASONING_EFFORTS
+        ):
+            errors.append("execution.reasoning_effort is invalid")
+
+    logging = config.get("logging")
+    if logging is not None and not isinstance(logging, dict):
+        errors.append("logging must be a mapping")
+    elif isinstance(logging, dict):
+        directory = logging.get("directory")
+        if not isinstance(directory, str) or not directory.strip():
+            errors.append("logging.directory must be a non-empty relative path")
+        else:
+            candidate = (repo_root / directory).resolve()
+            if not _is_relative_to(candidate, repo_root):
+                errors.append("logging.directory must stay inside the repository")
+
+    for path, value in _iter_values(config):
+        final_key = path.rsplit(".", 1)[-1].lower()
+        if any(marker in final_key for marker in SECRET_KEY_MARKERS):
+            if value is not None and value != "":
+                errors.append(f"{path} must not contain a hard-coded secret")
+
+    state_value = _nested(config, "state", "path")
+    if isinstance(state_value, str) and state_value.strip():
+        state_candidate = (repo_root / state_value).resolve()
+        parent = state_candidate.parent
+        while not parent.exists() and parent != repo_root.parent:
+            parent = parent.parent
+        if parent.exists() and not os.access(parent, os.W_OK):
+            errors.append("state.path parent is not writable")
 
     return errors
 
@@ -211,10 +458,24 @@ def resolve_task_config(task_reference: str, repo_root: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("task", help="Task id or path to task.yaml")
+    parser.add_argument("task", nargs="?", help="Task id or path to task.yaml")
+    parser.add_argument(
+        "--all", action="store_true", help="Validate every discovered task"
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
+    if args.all:
+        reports = validate_all_tasks(repo_root)
+        result = {
+            "valid": bool(reports) and all(report["valid"] for report in reports),
+            "task_count": len(reports),
+            "tasks": reports,
+        }
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result["valid"] else 1
+    if not args.task:
+        parser.error("task is required unless --all is used")
     config_path = resolve_task_config(args.task, repo_root)
     try:
         config = load_task_config(config_path)

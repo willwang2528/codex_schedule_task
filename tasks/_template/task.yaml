@@ -5,10 +5,11 @@ enabled: false
 
 schedule:
   timezone: Asia/Shanghai
-  cron: "0 8 * * *"
+  triggers: ["08:00"]
+  catch_up_minutes: 60
 
 workflow:
-  type: codex
+  type: codex_structured
 
 task_prompt:
   path: tasks/_template/TASK.md
@@ -16,6 +17,17 @@ task_prompt:
 delivery:
   type: feishu
   enabled: false
+  target: configured_chat
+  # Optional hard allowlist; omitted means every schedule trigger may notify.
+  # notification_triggers: ["09:00"]
+  policy: conditional
+  presentation: post
+  retry_attempts: 2
+
+execution:
+  timeout_seconds: 1200
+  retry_attempts: 2
+  retry_backoff_seconds: 20
 
 output:
   save_local: true
@@ -24,3 +36,7 @@ output:
 state:
   enabled: true
   path: state/_template.json
+  context_recent_items: 25
+
+logging:
+  directory: logs/_template

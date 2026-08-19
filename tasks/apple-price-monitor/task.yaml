@@ -1,0 +1,41 @@
+id: apple-price-monitor
+name: 苹果产品优惠监控
+enabled: true
+
+schedule:
+  timezone: Asia/Shanghai
+  triggers: ["10:00"]
+  catch_up_minutes: 720
+
+workflow:
+  type: codex_structured
+
+task_prompt:
+  path: tasks/apple-price-monitor/TASK.md
+
+execution:
+  model: gpt-5.6-terra
+  reasoning_effort: high
+  timeout_seconds: 1200
+  retry_attempts: 2
+  retry_backoff_seconds: 30
+
+delivery:
+  type: feishu
+  enabled: true
+  target: configured_chat
+  policy: always
+  presentation: price_alert_cards
+  retry_attempts: 2
+
+output:
+  save_local: true
+  directory: outputs/apple-price-monitor
+
+state:
+  enabled: true
+  path: state/apple-price-monitor.json
+  context_recent_items: 30
+
+logging:
+  directory: logs/apple-price-monitor

@@ -5,29 +5,26 @@
 Automation Hub keeps the scheduler generic and task behavior isolated.
 
 ```text
-Scheduler / Codex scheduled task
-              ↓
-       task.yaml + TASK.md
-              ↓
-       shared skills + scripts
-              ↓
-     research or deterministic work
-              ↓
-        local output + state
-              ↓
-             delivery
-              ↓
-          Feishu chat
+launchd → generic scheduler → task.yaml + TASK.md
+                              ↓
+                       structured Codex Agent
+                              ↓
+                 validate result + save outputs
+                              ↓
+                    atomic state transaction
+                              ↓
+                 conditional idempotent delivery
 ```
 
 ## Responsibilities
 
 | Layer | Owns | Must not own |
 | --- | --- | --- |
-| Codex scheduled task | cadence, project, short pointer prompt | duplicated long business prompt |
-| `tasks/<id>/` | objective, business rules, schedule metadata, paths | rules for unrelated tasks |
+| launchd + Scheduler | discover enabled tasks and trigger due slots | task-specific business logic |
+| `tasks/<id>/` | objective, business rules, schedule metadata, paths | rules for unrelated tasks or secrets |
 | `skills/` | reusable research, verification, ranking, delivery decisions | one task's full prompt |
-| `scripts/` | validation, path preparation, HTTP delivery, deterministic checks | Agent Memory research policy |
+| Runner/Harness | prompt/state loading, result validation, transaction, dedup, delivery, logs | stock, pricing, or paper-selection policy |
+| Codex Agent | data gathering and business judgment; structured result proposal | direct state writes or message delivery |
 | `outputs/` | finalized local artifacts | secrets |
 | `state/` | deduplication and run continuity | access tokens |
 | `logs/` | sanitized operational status | credentials or full API responses |
@@ -36,46 +33,67 @@ Scheduler / Codex scheduled task
 
 1. `scripts/run_task.py` resolves `tasks/<id>/task.yaml`.
 2. `scripts/validate_task.py` validates schema, task isolation, and repository-relative paths.
-3. The entrypoint prepares output, state, and daily log paths.
-4. A configured deterministic script may run. Otherwise, the entrypoint returns `ready_for_codex` with the durable prompt path.
-5. Codex follows `AGENTS.md`, the task prompt, and applicable shared skills.
-6. The final result is saved locally before optional delivery.
-7. State is updated only after finalization. Delivery status and sanitized errors are appended to the log.
+3. The Runner creates a deterministic run_id, serializes the task, and persists a recoverable `RUNNING` record.
+4. The Codex Agent receives the immutable business Prompt plus bounded relevant state and returns the strict schema in `config/task-result.schema.json`.
+5. The Harness validates status, notification fields, source freshness metadata, and proposed domain-state updates.
+6. JSON/Markdown outputs are saved under `outputs/<task-id>/<YYYY-MM-DD>/`.
+7. Valid non-failed domain state is merged and written with temp file + fsync + atomic rename. A failed result changes only operational retry metadata.
+8. `SUCCESS_NOTIFY` creates a stable pending notification before delivery. Card-profile tasks render semantic data into Feishu Card 2.0; every card receives its own deterministic UUID and is checkpointed after sending. Partial multi-card failure remains recoverable without rerunning the Agent.
+9. A timezone-aware JSONL run record is appended to `logs/<task-id>/`.
 
-`run_task.py` dispatches deterministic executors by a validated path from YAML; it does not switch on task ids. Research remains in the current Codex runtime, so no `OPENAI_API_KEY` is required.
+`run_task.py` and `scheduler.py` do not switch on task IDs. The existing deterministic smoke executor remains supported.
 
 ## Task schema
 
 ```yaml
-id: agent-memory-daily
-name: Agent Memory Daily Brief
+id: example-task
+name: Example Task
 enabled: true
 
 schedule:
   timezone: Asia/Shanghai
-  cron: "0 8 * * *"
+  triggers: ["09:00", "15:00"]
+  catch_up_minutes: 60
 
 workflow:
-  type: research_topk
-  top_k: 5
+  type: codex_structured
+  # Optional task-owned JSON evidence collector executed before the Agent:
+  # context_script: tasks/example-task/collect_context.py
+  # context_timeout_seconds: 90
 
 task_prompt:
-  path: tasks/agent-memory-daily/TASK.md
+  path: tasks/example-task/TASK.md
+
+execution:
+  timeout_seconds: 1200
+  retry_attempts: 2
+  retry_backoff_seconds: 20
 
 delivery:
   type: feishu
   enabled: true
+  target: configured_chat
+  # Optional per-task destination; shared App ID/Secret remain unchanged:
+  # chat_id_env: FEISHU_CHAT_ID_EXAMPLE_TASK_SCHEDULE_TASK
+  # Optional hard allowlist: all schedule slots still run, only these may notify:
+  # notification_triggers: ["09:00"]
+  policy: conditional
+  presentation: post
+  retry_attempts: 2
 
 output:
   save_local: true
-  directory: outputs/agent-memory-daily
+  directory: outputs/example-task
 
 state:
   enabled: true
-  path: state/agent-memory-daily.json
+  path: state/example-task.json
+
+logging:
+  directory: logs/example-task
 ```
 
-The repository uses a dependency-free mapping-only YAML parser. Task YAML supports nested mappings and scalar strings, booleans, numbers, and null values. Keep the long prompt in `TASK.md` and avoid YAML lists or multiline blocks.
+The repository uses a dependency-free YAML subset parser. It supports nested mappings, scalar values, and inline JSON arrays/objects. Keep the long prompt in `TASK.md`; do not use multiline YAML blocks.
 
 ## Logs and failure semantics
 
@@ -85,11 +103,12 @@ Each run appends a JSON line to:
 logs/<task-id>/<YYYY-MM-DD>.log
 ```
 
-Every record contains `task`, `start_time`, `end_time`, `status`, `output_path`, `delivery_status`, and `error`.
+Every production record contains `task_id`, `run_id`, `scheduled_at`, `started_at`, `finished_at`, `status`, `trigger_slot`, `state_version`, `notification_sent`, `delivery_status`, `output_path`, and `error`.
 
-- Research failure: log failure; do not create a fake result.
-- Research success and delivery failure: retain output; mark delivery failed.
-- Missing optional Feishu configuration: mark delivery skipped.
+- Agent/business failure: retain diagnostic output; do not merge proposed domain state.
+- Agent success and delivery failure: retain output and committed domain state; keep notification pending for recovery.
+- No meaningful event is `SUCCESS_NO_NOTIFY`, not an error.
+- Non-trading day or other valid no-op is `SKIPPED`, not an error.
 - Deterministic smoke failure: persist observations, return non-zero, and log the error.
 
-Generated outputs and logs are ignored by Git. The initial Agent Memory state file is tracked so the schema and baseline are explicit; scheduled executions may update it locally.
+Generated outputs, logs, and runtime `state/*.json` files are ignored by Git. State structure is defined by the result schema and tests; unattended executions update only local state.

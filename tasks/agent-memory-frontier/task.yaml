@@ -1,0 +1,42 @@
+id: agent-memory-frontier
+name: Agent Memory 前沿增量追踪
+enabled: true
+
+schedule:
+  timezone: Asia/Shanghai
+  triggers: ["09:00"]
+  catch_up_minutes: 720
+
+workflow:
+  type: codex_structured
+  top_k: 5
+
+task_prompt:
+  path: tasks/agent-memory-frontier/TASK.md
+
+execution:
+  model: gpt-5.6-sol
+  reasoning_effort: high
+  timeout_seconds: 1800
+  retry_attempts: 2
+  retry_backoff_seconds: 30
+
+delivery:
+  type: feishu
+  enabled: true
+  target: configured_chat
+  policy: conditional
+  presentation: research_top5_cards
+  retry_attempts: 2
+
+output:
+  save_local: true
+  directory: outputs/agent-memory-frontier
+
+state:
+  enabled: true
+  path: state/agent-memory-frontier.json
+  context_recent_items: 40
+
+logging:
+  directory: logs/agent-memory-frontier

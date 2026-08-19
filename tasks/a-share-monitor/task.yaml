@@ -1,0 +1,46 @@
+id: a-share-monitor
+name: A股全时段监盘
+enabled: true
+
+schedule:
+  timezone: Asia/Shanghai
+  triggers: ["09:20", "09:25", "09:35", "09:45", "11:20", "13:15", "14:30", "15:01"]
+  catch_up_minutes: 20
+
+workflow:
+  type: codex_structured
+  context_script: tasks/a-share-monitor/collect_market_data.py
+  context_timeout_seconds: 90
+
+task_prompt:
+  path: tasks/a-share-monitor/TASK.md
+
+execution:
+  model: gpt-5.6-terra
+  reasoning_effort: high
+  timeout_seconds: 1200
+  retry_attempts: 2
+  retry_backoff_seconds: 20
+
+delivery:
+  type: feishu
+  enabled: true
+  target: configured_chat
+  chat_id_env: FEISHU_CHAT_ID_A_SHARE_MONITOR_SCHEDULE_TASK
+  notification_triggers: ["11:20", "15:01"]
+  policy: conditional
+  presentation: market_dashboard_card
+  retry_attempts: 2
+
+output:
+  save_local: true
+  directory: outputs/a-share-monitor
+
+state:
+  enabled: true
+  path: state/a-share-monitor.json
+  context_recent_items: 30
+  track_trigger_slots: true
+
+logging:
+  directory: logs/a-share-monitor

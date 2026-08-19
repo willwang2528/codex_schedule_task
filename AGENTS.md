@@ -19,7 +19,7 @@ Reuse `skills/` for agent workflows and `scripts/` for deterministic mechanics. 
 
 ## Task isolation
 
-Adding or changing one task must not require edits to another task. A new task should normally require only a new `tasks/<task-id>/` directory and a new Codex scheduled task that points to it.
+Adding or changing one task must not require edits to another task. A new task should normally require only a new `tasks/<task-id>/` directory; the generic Scheduler discovers valid definitions automatically.
 
 ## Research source order
 
@@ -52,9 +52,14 @@ Never search for exactly the requested Top K and send those results without inde
 
 - Preserve a successful result locally even when delivery fails.
 - On research failure, record the error and do not fabricate a result.
-- Read task state before selection and write state only after a result is finalized.
+- The Agent returns only the structured result schema. It must not write state, outputs, logs, task files, or send Feishu itself.
+- For card-enabled tasks, return only semantic `notification.cards` fields. Never construct raw Feishu Card JSON; the Harness owns validation, escaping, rendering, optional image upload, and multi-card delivery.
+- Card renderer fields must match the per-component Card 2.0 documentation allowlist. Do not copy undocumented fields from style-guide examples; run the renderer tests and a real bot delivery check before enabling a new component shape.
+- Read task state before selection and atomically write domain state only after a valid result is finalized.
+- Failed results must use an empty state update and must not overwrite trusted business state.
+- Use only `SUCCESS_NOTIFY`, `SUCCESS_NO_NOTIFY`, `SKIPPED`, or `FAILED`.
 - Treat a materially changed publication, code release, or benchmark as an update, not a new item.
-- Logs must include task, start time, end time, status, output path, delivery status, and a sanitized error.
+- Logs must include task id, run id, scheduled/start/finish timestamps, trigger slot, state version, status, notification state, output path, and a sanitized error.
 
 ## Secrets
 

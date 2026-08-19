@@ -1,60 +1,35 @@
-# Codex Scheduled Task Setup
+# macOS Automation Hub Scheduler
 
-The official [Scheduled tasks documentation](https://learn.chatgpt.com/docs/automations) says local scheduled tasks can run in a selected project directory or an isolated Git worktree. The computer must remain powered on, the desktop app must remain running, and the local project must still be available when the run starts.
+本项目使用一个 macOS LaunchAgent 常驻运行通用 Scheduler。不要再为三个 Task 分别创建 Codex Automation 或 cron，否则会产生重复执行入口。
 
-## Required preflight
-
-Before enabling the daily task:
+## 安装前检查
 
 ```bash
-python3 scripts/validate_task.py smoke-test
-python3 scripts/run_task.py smoke-test
-python3 scripts/validate_task.py agent-memory-daily
-python3 scripts/run_task.py agent-memory-daily
+cd ~/project/schedule_task/codex_schedule_task
+python3 scripts/validate_task.py --all
+python3 scripts/scheduler.py --list
+python3 -m unittest discover -s tests -v
+python3 scripts/scheduler.py --run-due \
+  --at '2026-08-19T10:00:00+08:00' \
+  --dry-run
 ```
 
-Then manually complete one full Agent Memory workflow in Codex and verify Candidate Discovery, Verification, Ranking, Top 5, local output, state, and optional Feishu delivery.
+## 安装和管理
 
-## Create Agent Memory Daily
+```bash
+python3 scripts/manage_scheduler.py install
+python3 scripts/manage_scheduler.py status
+python3 scripts/manage_scheduler.py stop
+python3 scripts/manage_scheduler.py start
+```
 
-In the desktop app, create a scheduled task with:
+安装位置：
 
 ```text
-Name: Agent Memory Daily
-Schedule: Daily at 08:00
-Timezone: Asia/Shanghai
-Project: this repository
-Execution location: local project
+~/Library/LaunchAgents/com.will.automation-hub.scheduler.plist
 ```
 
-The local project is recommended for this task because deduplication state must persist between runs. Keep generated outputs and logs ignored, and review the first few runs. An isolated worktree is safer for source changes but requires a separate strategy for persistent state.
-
-Use this short prompt:
-
-```text
-Open this repository.
-
-Execute the task defined at:
-tasks/agent-memory-daily/TASK.md
-
-Follow:
-AGENTS.md
-
-and:
-tasks/agent-memory-daily/task.yaml
-
-Use available Codex web, research, browser, and local tools as needed.
-
-Complete the entire workflow:
-Discovery → Verification → Ranking → Top 5 → Save output → Feishu delivery.
-
-First run:
-python3 scripts/run_task.py agent-memory-daily
-
-Do not use OpenAI API keys. Use the current Codex/ChatGPT runtime.
-```
-
-The scheduled prompt intentionally contains paths, not the long research prompt. Updating `TASK.md` therefore changes future behavior without recreating the scheduled task.
+它通过系统自带的 `caffeinate -i` 常驻运行，每 30 秒检查一次时间点：显示器仍可休眠，但系统不会因闲置而睡眠。它仅运行 `enabled: true` 的 Task；已完成 run_id 会从持久状态中识别并跳过；投递失败的 pending notification 会优先恢复，不会重跑 Agent。
 
 ## Runtime environment
 
@@ -68,12 +43,20 @@ FEISHU_CHAT_ID_SCHEDULE_TASK
 
 The Feishu module automatically loads these namespaced keys from the ignored local file `config/.env`. Explicit process environment values take precedence. Unsuffixed Feishu variable names are intentionally unsupported to avoid collisions with other projects.
 
-When the three namespaced values are absent, research and local output can still succeed and delivery is `skipped`.
+All tasks share the same App ID and App Secret. A task may override only its destination by setting `delivery.chat_id_env` to a namespaced local variable such as `FEISHU_CHAT_ID_A_SHARE_MONITOR_SCHEDULE_TASK`; tasks without this field continue using `FEISHU_CHAT_ID_SCHEDULE_TASK`.
+
+Task A also uses `delivery.notification_triggers: ["11:20", "15:01"]`. Its other six daily slots remain active data runs, but cannot create, send, or recover a Feishu notification.
+
+缺少配置时，真正需要通知的执行会保留 pending notification 并返回明确失败；补齐配置后可用以下命令恢复，不重复研究：
+
+```bash
+python3 scripts/run_task.py <task-id> --recover-pending
+```
 
 ## Operations
 
-- Keep the Mac awake and the desktop app running before 08:00.
+- Keep the Mac powered on and logged in; LaunchAgent belongs to the current GUI user session. Manual sleep or shutdown still suspends execution.
 - Keep the repository path stable.
 - Review the first few scheduled runs before relying on unattended delivery.
-- Inspect `logs/agent-memory-daily/<date>.log` and the local report after a failure.
+- Inspect `logs/scheduler/`, `logs/<task-id>/<date>.log`, and the local run output after a failure.
 - Re-run a failed delivery from the saved output; do not repeat research solely because Feishu failed.
