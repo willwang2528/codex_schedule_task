@@ -378,7 +378,7 @@ def _pin_daily_archive(
             archive["pinned_at"] = now_in(timezone_name).isoformat(timespec="seconds")
             archive["last_error"] = None
             return
-        except (FeishuDeliveryError, OSError, TaskRuntimeError) as exc:
+        except Exception as exc:
             archive["status"] = "failed"
             archive["last_error"] = _sanitize_error(str(exc))
             if attempt < retry_attempts:
@@ -494,10 +494,15 @@ def _deliver_pending(
                     raise TaskRuntimeError("pending notification kind is invalid")
                 if not isinstance(response, dict):
                     raise TaskRuntimeError("delivery adapter returned an invalid response")
+                response_message_id = response.get("message_id")
+                if not isinstance(response_message_id, str) or not response_message_id:
+                    raise TaskRuntimeError(
+                        "delivery adapter returned no non-empty message_id"
+                    )
                 message_sent_at = now_in(timezone_name).isoformat(timespec="seconds")
                 message["status"] = "sent"
                 message["sent_at"] = message_sent_at
-                message["message_id"] = response.get("message_id")
+                message["message_id"] = response_message_id
                 message["last_error"] = None
                 notification["updated_at"] = message_sent_at
                 notification["last_error"] = None

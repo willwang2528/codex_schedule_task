@@ -48,6 +48,19 @@ Search
 
 Never search for exactly the requested Top K and send those results without independent verification and ranking.
 
+## Test-driven changes
+
+Every feature, bug fix, refactor, or behavior change must follow RED—GREEN—REFACTOR:
+
+1. Write one focused test that names the observable regression it catches.
+2. Run that test and confirm it fails for the intended production reason.
+3. Add only the minimum implementation required to make it pass.
+4. Run the focused test, then the complete local quality gate.
+
+Prefer real task configuration, temporary state/output files, and rendered payloads over source-text assertions. Replace only external boundaries such as Codex execution, Feishu HTTP, remote image download, or LaunchAgent control. Optional enhancements must have explicit failure-isolation tests proving that collection, trusted state, local output, and original notification delivery remain usable.
+
+The maintained behavior matrix, mutation checklist, and required commands live in `docs/TEST_STRATEGY.md`.
+
 ## Outputs, state, and failure handling
 
 - Preserve a successful result locally even when delivery fails.

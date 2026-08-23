@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ import feishu_send
 import feishu_cards
 import manage_scheduler
 import production_runner
+import scheduler
 from feishu_send import FeishuDeliveryError
 from production_runner import execute_production_task, recover_pending_delivery
 from scheduler import discover_tasks, due_runs
@@ -249,6 +251,44 @@ class RepositoryContractTests(unittest.TestCase):
             errors,
         )
 
+    def test_daily_archive_config_rejects_each_malformed_shape(self) -> None:
+        config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
+        base_config = load_task_config(config_path)
+        cases = (
+            ([], "delivery.daily_archive must be a mapping"),
+            (
+                {"enabled": "yes", "trigger_slots": ["15:01"]},
+                "delivery.daily_archive.enabled must be true or false",
+            ),
+            (
+                {"enabled": True, "trigger_slots": []},
+                "delivery.daily_archive.trigger_slots must be a non-empty inline list",
+            ),
+            (
+                {"enabled": True, "trigger_slots": ["25:00"]},
+                "delivery.daily_archive.trigger_slots values must use HH:MM (24-hour time)",
+            ),
+            (
+                {"enabled": True, "trigger_slots": ["15:01", "15:01"]},
+                "delivery.daily_archive.trigger_slots must not contain duplicates",
+            ),
+        )
+
+        for archive_config, expected_error in cases:
+            with self.subTest(archive_config=archive_config):
+                config = copy.deepcopy(base_config)
+                config["delivery"]["daily_archive"] = archive_config
+
+                errors = validate_task_config(config, config_path, REPO_ROOT)
+
+                self.assertIn(expected_error, errors)
+
+    def test_task_c_execution_budget_remains_two_hours(self) -> None:
+        config = load_task_config(
+            REPO_ROOT / "tasks" / "agent-memory-frontier" / "task.yaml"
+        )
+        self.assertEqual(2 * 60 * 60, config["execution"]["timeout_seconds"])
+
     def test_task_b_always_reports_daily_status(self) -> None:
         config = load_task_config(REPO_ROOT / "tasks" / "apple-price-monitor" / "task.yaml")
         prompt = (REPO_ROOT / "tasks" / "apple-price-monitor" / "TASK.md").read_text(
@@ -316,6 +356,195 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn(str(REPO_ROOT / "scripts" / "scheduler.py"), arguments)
 
 
+class SchedulerRegressionTests(unittest.TestCase):
+    def test_pending_delivery_recovers_before_same_task_due_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            scripts = repo / "scripts"
+            scripts.mkdir()
+            shutil.copy2(REPO_ROOT / "scripts" / "smoke_test.py", scripts)
+            (scripts / "run_task.py").write_text(
+                "import json\n"
+                "import sys\n"
+                "mode = 'recover' if '--recover-pending' in sys.argv else 'execute'\n"
+                "print(json.dumps({'mode': mode, 'task_id': sys.argv[1]}))\n",
+                encoding="utf-8",
+            )
+            atomic_write_json(
+                repo / "state" / "a-share-monitor.json",
+                {
+                    "_runtime": {
+                        "processed_runs": {},
+                        "notifications": {
+                            "pending-market": {
+                                "status": "pending",
+                                "event_key": "market:pending",
+                            }
+                        },
+                    }
+                },
+            )
+            for task_id, slot in (
+                ("agent-memory-frontier", "09:00"),
+                ("apple-price-monitor", "10:00"),
+            ):
+                hour, minute = (int(part) for part in slot.split(":"))
+                scheduled = datetime(
+                    2026,
+                    8,
+                    19,
+                    hour,
+                    minute,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                ).isoformat(timespec="seconds")
+                run_id = make_run_id(task_id, scheduled, slot)
+                atomic_write_json(
+                    repo / "state" / f"{task_id}.json",
+                    {
+                        "_runtime": {
+                            "processed_runs": {
+                                run_id: {"terminal": True, "status": SUCCESS_NO_NOTIFY}
+                            },
+                            "notifications": {},
+                        }
+                    },
+                )
+            at = datetime(
+                2026, 8, 19, 15, 1, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+
+            result = scheduler.run_once(
+                repo,
+                at=at,
+                dry_run=False,
+                recover_pending=True,
+            )
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertEqual(
+            [
+                {"mode": "recover", "task_id": "a-share-monitor"},
+                {"mode": "execute", "task_id": "a-share-monitor"},
+            ],
+            [
+                {"mode": item["mode"], "task_id": item["task_id"]}
+                for item in result["results"]
+            ],
+        )
+
+
+class TaskBehaviorRegressionTests(unittest.TestCase):
+    def test_task_a_real_config_enforces_collection_send_and_archive_matrix(self) -> None:
+        config = load_task_config(
+            REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
+        )
+        cases = (
+            ("09:20", SUCCESS_NO_NOTIFY, 0, []),
+            ("09:35", SUCCESS_NOTIFY, 3, []),
+            ("11:20", SUCCESS_NOTIFY, 3, []),
+            ("15:01", SUCCESS_NOTIFY, 3, ["om_15_01_1"]),
+        )
+
+        for slot, expected_status, expected_sends, expected_pins in cases:
+            with self.subTest(slot=slot), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory).resolve()
+                prompt_path = repo / "tasks" / "a-share-monitor" / "TASK.md"
+                prompt_path.parent.mkdir(parents=True)
+                shutil.copy2(
+                    REPO_ROOT / "tasks" / "a-share-monitor" / "TASK.md",
+                    prompt_path,
+                )
+                state_path = repo / "state" / "a-share-monitor.json"
+                atomic_write_json(
+                    state_path,
+                    {
+                        "schema_version": 1,
+                        "task_id": "a-share-monitor",
+                        "state_version": 0,
+                        "_runtime": {"processed_runs": {}, "notifications": {}},
+                    },
+                )
+                output_directory = repo / "outputs" / "a-share-monitor"
+                sends = []
+                pins = []
+                hour, minute = (int(part) for part in slot.split(":"))
+                scheduled_at = datetime(
+                    2026,
+                    8,
+                    19,
+                    hour,
+                    minute,
+                    tzinfo=ZoneInfo("Asia/Shanghai"),
+                )
+                agent_result = (
+                    structured_result(
+                        SUCCESS_NOTIFY,
+                        event_key=f"market:2026-08-19:{slot}",
+                        cards=market_dashboard_cards(),
+                    )
+                    if expected_status == SUCCESS_NOTIFY
+                    else structured_result(
+                        SUCCESS_NO_NOTIFY,
+                        updates={"last_collected_slot": slot},
+                    )
+                )
+
+                with patch.object(
+                    production_runner,
+                    "_load_workflow_evidence",
+                    return_value={"status": "ok", "collector": "fixture"},
+                ):
+                    result = execute_production_task(
+                        repo_root=repo,
+                        config=config,
+                        prompt_path=prompt_path,
+                        state_path=state_path,
+                        output_directory=output_directory,
+                        scheduled_at=scheduled_at,
+                        trigger_slot=slot,
+                        agent_runner=lambda prompt, task_config, root: agent_result,
+                        delivery_sender=lambda text, **kwargs: (
+                            sends.append(kwargs)
+                            or {
+                                "status": "ok",
+                                "message_id": f"om_{slot.replace(':', '_')}_{len(sends)}",
+                            }
+                        ),
+                        pin_sender=lambda message_id: (
+                            pins.append(message_id)
+                            or {"status": "ok", "message_id": message_id}
+                        ),
+                    )
+
+                state = read_json_object(state_path)
+                self.assertEqual(expected_status, result["status"])
+                self.assertEqual(expected_sends, len(sends))
+                self.assertEqual(expected_pins, pins)
+                self.assertEqual(1, state["state_version"])
+                self.assertTrue((repo / result["output_json"]).is_file())
+                if slot == "09:20":
+                    self.assertEqual("09:20", state["last_collected_slot"])
+                    self.assertEqual({}, state["_runtime"]["notifications"])
+                elif slot == "15:01":
+                    notification = next(
+                        iter(state["_runtime"]["notifications"].values())
+                    )
+                    self.assertEqual(
+                        "pinned", notification["daily_archive"]["status"]
+                    )
+                    self.assertEqual(
+                        "om_15_01_1",
+                        notification["daily_archive"]["message_id"],
+                    )
+                else:
+                    notification = next(
+                        iter(state["_runtime"]["notifications"].values())
+                    )
+                    self.assertNotIn("daily_archive", notification)
+
+
 class ProductionRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -363,12 +592,15 @@ class ProductionRuntimeTests(unittest.TestCase):
         result: Dict[str, Any],
         *,
         sender: Any = None,
+        pin_sender: Any = None,
         scheduled_at: datetime | None = None,
         trigger_slot: str = "09:20",
     ) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {}
         if sender is not None:
             kwargs["delivery_sender"] = sender
+        if pin_sender is not None:
+            kwargs["pin_sender"] = pin_sender
         return execute_production_task(
             repo_root=self.repo,
             config=self.config,
@@ -467,6 +699,20 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertEqual(0, state["state_version"])
         self.assertNotIn("last_run_at", state)
 
+    def test_agent_cannot_overwrite_harness_owned_runtime_state(self) -> None:
+        result = self.execute(
+            structured_result(
+                SUCCESS_NO_NOTIFY,
+                updates={"_runtime": {"notifications": {}}},
+            )
+        )
+
+        state = read_json_object(self.state_path)
+        self.assertEqual(FAILED, result["status"])
+        self.assertEqual(0, state["state_version"])
+        self.assertIn("Harness-owned keys", result["error"])
+        self.assertNotEqual({}, state["_runtime"]["processed_runs"])
+
     def test_notification_idempotency_dedup_and_duplicate_run(self) -> None:
         calls = []
 
@@ -531,6 +777,20 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertEqual(1, recovery["recovered"])
         self.assertEqual(1, len(sends))
         self.assertEqual(1, len(agent_calls))
+
+    def test_delivery_response_requires_nonempty_message_id(self) -> None:
+        result = self.execute(
+            structured_result(SUCCESS_NOTIFY, event_key="delivery:missing-id"),
+            sender=lambda text, **kwargs: {"status": "ok"},
+        )
+
+        state = read_json_object(self.state_path)
+        notification = next(iter(state["_runtime"]["notifications"].values()))
+        self.assertEqual(FAILED, result["status"])
+        self.assertEqual("failed", result["delivery_status"])
+        self.assertEqual("pending", notification["status"])
+        self.assertEqual("pending", notification["messages"][0]["status"])
+        self.assertIn("message_id", notification["messages"][0]["last_error"])
 
     def test_task_chat_route_is_forwarded_to_delivery_adapter(self) -> None:
         self.config["delivery"]["chat_id_env"] = (
@@ -637,17 +897,17 @@ class ProductionRuntimeTests(unittest.TestCase):
                 "create_time": "1787410860000",
             }
 
-        with patch.object(production_runner, "pin_message", create=True, new=pinner):
-            result = self.execute(
-                structured_result(
-                    SUCCESS_NOTIFY,
-                    event_key="market:2026-08-19:15:01",
-                    cards=market_dashboard_cards(),
-                ),
-                sender=sender,
-                scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
-                trigger_slot="15:01",
-            )
+        result = self.execute(
+            structured_result(
+                SUCCESS_NOTIFY,
+                event_key="market:2026-08-19:15:01",
+                cards=market_dashboard_cards(),
+            ),
+            sender=sender,
+            pin_sender=pinner,
+            scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
+            trigger_slot="15:01",
+        )
 
         state = read_json_object(self.state_path)
         notification = next(iter(state["_runtime"]["notifications"].values()))
@@ -684,22 +944,20 @@ class ProductionRuntimeTests(unittest.TestCase):
         def must_not_pin(message_id: str) -> Dict[str, Any]:
             raise AssertionError(f"unexpected Pin for {message_id}")
 
-        with patch.object(
-            production_runner, "pin_message", create=True, new=must_not_pin
-        ):
-            result = self.execute(
-                structured_result(
-                    SUCCESS_NOTIFY,
-                    event_key="market:2026-08-19:11:20",
-                    cards=market_dashboard_cards(),
-                ),
-                sender=lambda text, **kwargs: (
-                    sends.append(kwargs)
-                    or {"status": "ok", "message_id": f"om_midday_{len(sends)}"}
-                ),
-                scheduled_at=self.scheduled_at.replace(hour=11, minute=20),
-                trigger_slot="11:20",
-            )
+        result = self.execute(
+            structured_result(
+                SUCCESS_NOTIFY,
+                event_key="market:2026-08-19:11:20",
+                cards=market_dashboard_cards(),
+            ),
+            sender=lambda text, **kwargs: (
+                sends.append(kwargs)
+                or {"status": "ok", "message_id": f"om_midday_{len(sends)}"}
+            ),
+            pin_sender=must_not_pin,
+            scheduled_at=self.scheduled_at.replace(hour=11, minute=20),
+            trigger_slot="11:20",
+        )
 
         state = read_json_object(self.state_path)
         notification = next(iter(state["_runtime"]["notifications"].values()))
@@ -721,25 +979,22 @@ class ProductionRuntimeTests(unittest.TestCase):
         )
         sends = []
 
-        with patch.object(
-            production_runner,
-            "pin_message",
-            create=True,
-            side_effect=FeishuDeliveryError("missing Pin permission"),
-        ):
-            result = self.execute(
-                structured_result(
-                    SUCCESS_NOTIFY,
-                    event_key="market:2026-08-19:15:01",
-                    cards=market_dashboard_cards(),
-                ),
-                sender=lambda text, **kwargs: (
-                    sends.append(kwargs)
-                    or {"status": "ok", "message_id": f"om_close_{len(sends)}"}
-                ),
-                scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
-                trigger_slot="15:01",
-            )
+        result = self.execute(
+            structured_result(
+                SUCCESS_NOTIFY,
+                event_key="market:2026-08-19:15:01",
+                cards=market_dashboard_cards(),
+            ),
+            sender=lambda text, **kwargs: (
+                sends.append(kwargs)
+                or {"status": "ok", "message_id": f"om_close_{len(sends)}"}
+            ),
+            pin_sender=lambda message_id: (_ for _ in ()).throw(
+                FeishuDeliveryError("missing Pin permission")
+            ),
+            scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
+            trigger_slot="15:01",
+        )
 
         state = read_json_object(self.state_path)
         notification = next(iter(state["_runtime"]["notifications"].values()))
@@ -753,6 +1008,120 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertIn(
             "missing Pin permission", archive["last_error"]
         )
+
+    def test_unexpected_daily_archive_error_never_breaks_original_delivery(self) -> None:
+        self.config["schedule"]["triggers"] = ["15:01"]
+        self.config["delivery"].update(
+            {
+                "presentation": "market_dashboard_card",
+                "notification_triggers": ["15:01"],
+                "daily_archive": {
+                    "enabled": True,
+                    "trigger_slots": ["15:01"],
+                },
+            }
+        )
+        sends = []
+
+        try:
+            result = self.execute(
+                structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="market:2026-08-19:15:01:unexpected-pin-error",
+                    cards=market_dashboard_cards(),
+                ),
+                sender=lambda text, **kwargs: (
+                    sends.append(kwargs)
+                    or {"status": "ok", "message_id": f"om_close_{len(sends)}"}
+                ),
+                pin_sender=lambda message_id: (_ for _ in ()).throw(
+                    RuntimeError("unexpected Pin adapter failure")
+                ),
+                scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
+                trigger_slot="15:01",
+            )
+        except RuntimeError as exc:
+            self.fail(f"optional daily archive error escaped delivery: {exc}")
+
+        state = read_json_object(self.state_path)
+        notification = next(iter(state["_runtime"]["notifications"].values()))
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(3, len(sends))
+        self.assertEqual("sent", notification["status"])
+        self.assertEqual("failed", notification["daily_archive"]["status"])
+        self.assertIn(
+            "unexpected Pin adapter failure",
+            notification["daily_archive"]["last_error"],
+        )
+
+    def test_partial_closing_delivery_pins_only_after_recovery_completes(self) -> None:
+        self.config["schedule"]["triggers"] = ["15:01"]
+        self.config["delivery"].update(
+            {
+                "presentation": "market_dashboard_card",
+                "notification_triggers": ["15:01"],
+                "daily_archive": {
+                    "enabled": True,
+                    "trigger_slots": ["15:01"],
+                },
+            }
+        )
+        initial_sends = []
+        pins = []
+
+        def partial_sender(text: str, **kwargs: Any) -> Dict[str, Any]:
+            initial_sends.append(kwargs["idempotency_key"])
+            if len(initial_sends) == 3:
+                raise FeishuDeliveryError("third closing card failed")
+            return {
+                "status": "ok",
+                "message_id": f"om_close_{len(initial_sends)}",
+            }
+
+        first = self.execute(
+            structured_result(
+                SUCCESS_NOTIFY,
+                event_key="market:2026-08-19:15:01:partial",
+                cards=market_dashboard_cards(),
+            ),
+            sender=partial_sender,
+            pin_sender=lambda message_id: (
+                pins.append(message_id)
+                or {"status": "ok", "message_id": message_id}
+            ),
+            scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
+            trigger_slot="15:01",
+        )
+
+        self.assertEqual(FAILED, first["status"])
+        self.assertEqual([], pins)
+
+        recovery_sends = []
+        recovery = recover_pending_delivery(
+            config=self.config,
+            state_path=self.state_path,
+            delivery_sender=lambda text, **kwargs: (
+                recovery_sends.append(kwargs["idempotency_key"])
+                or {"status": "ok", "message_id": "om_close_3"}
+            ),
+            pin_sender=lambda message_id: (
+                pins.append(message_id)
+                or {"status": "ok", "message_id": message_id}
+            ),
+        )
+
+        state = read_json_object(self.state_path)
+        notification = next(iter(state["_runtime"]["notifications"].values()))
+        self.assertEqual(SUCCESS_NO_NOTIFY, recovery["status"])
+        self.assertEqual(1, recovery["recovered"])
+        self.assertEqual(1, len(recovery_sends))
+        self.assertEqual(["om_close_1"], pins)
+        self.assertEqual("sent", notification["status"])
+        self.assertEqual(
+            ["om_close_1", "om_close_2", "om_close_3"],
+            notification["message_ids"],
+        )
+        self.assertEqual("pinned", notification["daily_archive"]["status"])
 
     def test_recovery_suppresses_pending_notification_from_data_only_slot(self) -> None:
         self.config["delivery"]["notification_triggers"] = [
@@ -1206,6 +1575,43 @@ class AdapterAndRetryTests(unittest.TestCase):
             {"message_id": "om_daily_close"},
             request.call_args_list[1].args[1],
         )
+
+    def test_feishu_pin_adapter_rejects_success_without_message_id(self) -> None:
+        responses = [
+            {"code": 0, "tenant_access_token": "tenant-token"},
+            {"code": 0, "data": {"pin": {"chat_id": "oc_market"}}},
+        ]
+        env = {
+            feishu_send.APP_ID_ENV_KEY: "app-id",
+            feishu_send.APP_SECRET_ENV_KEY: "app-secret",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            feishu_send, "_request_json", side_effect=responses
+        ):
+            with self.assertRaisesRegex(
+                FeishuDeliveryError, "returned no message_id"
+            ):
+                feishu_send.pin_message("om_daily_close")
+
+    def test_feishu_pin_error_redacts_configured_secret(self) -> None:
+        secret = "local-app-secret-value"
+        responses = [
+            {"code": 0, "tenant_access_token": "tenant-token"},
+            {"code": 999, "msg": f"permission denied for {secret}"},
+        ]
+        env = {
+            feishu_send.APP_ID_ENV_KEY: "app-id",
+            feishu_send.APP_SECRET_ENV_KEY: secret,
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            feishu_send, "_request_json", side_effect=responses
+        ):
+            with self.assertRaises(FeishuDeliveryError) as raised:
+                feishu_send.pin_message("om_daily_close")
+
+        error = str(raised.exception)
+        self.assertNotIn(secret, error)
+        self.assertIn("[REDACTED]", error)
 
     def test_feishu_adapter_forwards_uuid_without_real_network(self) -> None:
         responses = [

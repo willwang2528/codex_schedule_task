@@ -77,6 +77,8 @@ FEISHU_CHAT_ID_SCHEDULE_TASK
 
 正式通知使用 Feishu Card 2.0：Agent Memory 固定五张研究卡，每张默认展示中文摘要，展开后按“现存问题—已有方法的不足—当前方法为什么可行—未来展望”快速浏览；A 股正常交易日使用“盘面总览—情绪与主线—异动与风险”三张渐进式市场卡，Apple 使用逐 SKU 价格卡。Agent Memory 卡片调研与取舍见 [论文速览卡片调研](docs/AGENT_MEMORY_PAPER_CARD_REVIEW.md)，A 股竞品调研与取舍见 [A 股分析产品复盘调研](docs/A_SHARE_COMPETITIVE_REVIEW.md)，实现与降级策略见 [飞书卡片投递](docs/FEISHU_CARDS.md)。
 
+新增功能和修复必须遵循 RED—GREEN—REFACTOR，并通过真实任务配置行为矩阵、Runner 临时状态集成测试和完整本地质量门禁，详见 [测试策略](docs/TEST_STRATEGY.md)。
+
 ## 新增任务
 
 ```bash
