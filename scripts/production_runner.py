@@ -21,7 +21,7 @@ from feishu_cards import (
     render_card,
     validate_presentation,
 )
-from feishu_send import FeishuDeliveryError, send_message, upload_remote_image
+from feishu_send import FeishuDeliveryError, pin_message, send_message, upload_remote_image
 from task_runtime import (
     FAILED,
     SKIPPED,
@@ -47,6 +47,7 @@ from task_runtime import (
 AgentRunner = Callable[[str, Dict[str, Any], Path], Dict[str, Any]]
 DeliverySender = Callable[..., Dict[str, Any]]
 ImageUploader = Callable[[str], str]
+PinSender = Callable[[str], Dict[str, Any]]
 RESERVED_STATE_UPDATE_KEYS = {
     "_runtime",
     "schema_version",
@@ -318,6 +319,72 @@ def _notification_trigger_slot(
     return None
 
 
+def _daily_archive_enabled(
+    delivery_config: Dict[str, Any], trigger_slot: Optional[str]
+) -> bool:
+    archive_config = delivery_config.get("daily_archive")
+    if not isinstance(archive_config, dict) or archive_config.get("enabled") is not True:
+        return False
+    trigger_slots = archive_config.get("trigger_slots")
+    return isinstance(trigger_slots, list) and trigger_slot in {
+        str(value) for value in trigger_slots
+    }
+
+
+def _pin_daily_archive(
+    *,
+    notification: Dict[str, Any],
+    messages: list[Any],
+    delivery_config: Dict[str, Any],
+    trigger_slot: Optional[str],
+    timezone_name: str,
+    pin_sender: Optional[PinSender],
+) -> None:
+    """Pin the first daily-review message without changing delivery success."""
+
+    if not _daily_archive_enabled(delivery_config, trigger_slot):
+        return
+    first_message_id = next(
+        (
+            str(message.get("message_id"))
+            for message in messages
+            if isinstance(message, dict)
+            and message.get("status") == "sent"
+            and isinstance(message.get("message_id"), str)
+            and message.get("message_id")
+        ),
+        "",
+    )
+    archive = notification.setdefault("daily_archive", {})
+    if not isinstance(archive, dict):
+        archive = {}
+        notification["daily_archive"] = archive
+    archive["message_id"] = first_message_id or None
+    archive["pinned_at"] = None
+    archive["last_error"] = None
+    if not first_message_id:
+        archive["status"] = "failed"
+        archive["last_error"] = "daily archive requires a delivered message_id"
+        return
+
+    operation = pin_sender or pin_message
+    retry_attempts = _config_int(delivery_config, "retry_attempts", 2)
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            response = operation(first_message_id)
+            if not isinstance(response, dict) or response.get("message_id") != first_message_id:
+                raise TaskRuntimeError("Pin adapter returned an invalid response")
+            archive["status"] = "pinned"
+            archive["pinned_at"] = now_in(timezone_name).isoformat(timespec="seconds")
+            archive["last_error"] = None
+            return
+        except (FeishuDeliveryError, OSError, TaskRuntimeError) as exc:
+            archive["status"] = "failed"
+            archive["last_error"] = _sanitize_error(str(exc))
+            if attempt < retry_attempts:
+                time.sleep(min(30, 2 ** (attempt - 1)))
+
+
 def _deliver_pending(
     *,
     task_id: str,
@@ -329,6 +396,7 @@ def _deliver_pending(
     dry_run_delivery: bool,
     delivery_sender: DeliverySender,
     image_uploader: ImageUploader,
+    pin_sender: Optional[PinSender] = None,
 ) -> Tuple[str, bool, Optional[str]]:
     _, notifications = _runtime_maps(state)
     notification = notifications.get(fingerprint)
@@ -448,6 +516,15 @@ def _deliver_pending(
         if message.get("status") != "sent":
             return "failed", False, last_error
 
+    _pin_daily_archive(
+        notification=notification,
+        messages=messages,
+        delivery_config=delivery_config,
+        trigger_slot=notification_trigger_slot,
+        timezone_name=timezone_name,
+        pin_sender=pin_sender,
+    )
+
     sent_at = now_in(timezone_name).isoformat(timespec="seconds")
     notification["status"] = "sent"
     notification["sent_at"] = sent_at
@@ -475,6 +552,7 @@ def recover_pending_delivery(
     dry_run_delivery: bool = False,
     delivery_sender: DeliverySender = send_message,
     image_uploader: ImageUploader = upload_remote_image,
+    pin_sender: Optional[PinSender] = None,
 ) -> Dict[str, Any]:
     state = read_json_object(state_path)
     _, notifications = _runtime_maps(state)
@@ -497,6 +575,7 @@ def recover_pending_delivery(
             dry_run_delivery=dry_run_delivery,
             delivery_sender=delivery_sender,
             image_uploader=image_uploader,
+            pin_sender=pin_sender,
         )
         if sent or delivery_status == "dry_run":
             recovered += 1
@@ -529,6 +608,7 @@ def execute_production_task(
     agent_runner: Optional[AgentRunner] = None,
     delivery_sender: DeliverySender = send_message,
     image_uploader: ImageUploader = upload_remote_image,
+    pin_sender: Optional[PinSender] = None,
 ) -> Dict[str, Any]:
     task_id = str(config["id"])
     task_name = str(config["name"])
@@ -590,6 +670,7 @@ def execute_production_task(
                         dry_run_delivery=dry_run_delivery,
                         delivery_sender=delivery_sender,
                         image_uploader=image_uploader,
+                        pin_sender=pin_sender,
                     )
                     duplicate_status = (
                         SUCCESS_NO_NOTIFY
@@ -856,6 +937,7 @@ def execute_production_task(
                         dry_run_delivery=dry_run_delivery,
                         delivery_sender=delivery_sender,
                         image_uploader=image_uploader,
+                        pin_sender=pin_sender,
                     )
                     if delivery_status == "failed":
                         status = FAILED

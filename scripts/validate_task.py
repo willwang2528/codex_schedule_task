@@ -384,6 +384,51 @@ def validate_task_config(
                     "delivery.notification_triggers must be a subset of schedule.triggers: "
                     + ", ".join(unknown_notification_triggers)
                 )
+    daily_archive = _nested(config, "delivery", "daily_archive")
+    if daily_archive is not None:
+        if not isinstance(daily_archive, dict):
+            errors.append("delivery.daily_archive must be a mapping")
+        else:
+            archive_enabled = daily_archive.get("enabled")
+            if not isinstance(archive_enabled, bool):
+                errors.append("delivery.daily_archive.enabled must be true or false")
+            archive_triggers = daily_archive.get("trigger_slots")
+            if not isinstance(archive_triggers, list) or not archive_triggers:
+                errors.append(
+                    "delivery.daily_archive.trigger_slots must be a non-empty inline list"
+                )
+            else:
+                normalized_archive_triggers = [
+                    str(value) for value in archive_triggers
+                ]
+                if any(
+                    not TRIGGER_PATTERN.fullmatch(value)
+                    for value in normalized_archive_triggers
+                ):
+                    errors.append(
+                        "delivery.daily_archive.trigger_slots values must use HH:MM (24-hour time)"
+                    )
+                if len(normalized_archive_triggers) != len(
+                    set(normalized_archive_triggers)
+                ):
+                    errors.append(
+                        "delivery.daily_archive.trigger_slots must not contain duplicates"
+                    )
+                notification_trigger_values = (
+                    {str(value) for value in notification_triggers}
+                    if isinstance(notification_triggers, list)
+                    else set()
+                )
+                unknown_archive_triggers = sorted(
+                    set(normalized_archive_triggers).difference(
+                        notification_trigger_values
+                    )
+                )
+                if unknown_archive_triggers:
+                    errors.append(
+                        "delivery.daily_archive.trigger_slots must be a subset of delivery.notification_triggers: "
+                        + ", ".join(unknown_archive_triggers)
+                    )
     delivery_retry = _nested(config, "delivery", "retry_attempts")
     if delivery_retry is not None and not _positive_int(delivery_retry):
         errors.append("delivery.retry_attempts must be a positive integer")

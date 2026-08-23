@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -36,8 +36,7 @@ from task_runtime import (
     read_json_object,
     run_lock,
 )
-from validate_task import validate_all_tasks
-from validate_task import load_task_config
+from validate_task import load_task_config, validate_all_tasks, validate_task_config
 
 
 def structured_result(
@@ -79,22 +78,70 @@ def semantic_card(
     rank: int = 1,
     image_url: str = "",
 ) -> Dict[str, Any]:
+    fields = [
+        {"label": "Status", "value": "Published", "short": True},
+        {"label": "Date", "value": "2026-08-19", "short": True},
+    ]
+    sections = [
+        {"title": "Summary", "content": "Verified contribution.", "collapsed": False},
+        {"title": "Why it matters", "content": "Improves agent memory.", "collapsed": True},
+        {"title": "Selection", "content": "Strong evidence.", "collapsed": True},
+    ]
+    if template == "research_item":
+        fields = [
+            {"label": "日期", "value": "2026-08-19", "short": True},
+            {"label": "状态", "value": "正式发表", "short": True},
+            {
+                "label": "Agent Memory 相关性",
+                "value": "改善长期记忆的写入与检索。",
+                "short": False,
+            },
+            {
+                "label": "入选理由",
+                "value": "方法贡献明确且有一手实验证据。",
+                "short": False,
+            },
+        ]
+        sections = [
+            {
+                "title": "中文摘要",
+                "content": "该研究解决长程任务中记忆写入与检索失配的问题。方法通过结构化经验索引保留可重用信息。跨任务实验显示完成率提升，但证据仍受模型与基准范围限制。",
+                "collapsed": False,
+            },
+            {
+                "title": "现存问题",
+                "content": "长程 Agent 会积累大量轨迹，关键经验难以稳定进入后续决策。",
+                "collapsed": True,
+            },
+            {
+                "title": "已有方法的不足",
+                "content": "仅依赖相似度检索会忽略经验的可执行结构与适用边界。",
+                "collapsed": True,
+            },
+            {
+                "title": "当前方法为什么可行",
+                "content": "结构化索引改变了记忆组织和调用路径，并由跨任务对照实验支持。",
+                "collapsed": True,
+            },
+            {
+                "title": "未来展望",
+                "content": "作者提出扩展至更多模型与更长时间跨度，当前还缺少真实环境验证。",
+                "collapsed": True,
+            },
+        ]
     return {
         "template": template,
         "title": f"Card {rank}",
-        "subtitle": "2026-08-19 · verified",
+        "subtitle": (
+            "解决长程任务中经验难以稳定复用的问题"
+            if template == "research_item"
+            else "2026-08-19 · verified"
+        ),
         "theme": "blue" if template == "research_item" else "green",
         "tag": f"TOP {rank}" if template == "research_item" else "ALERT",
         "focus": {"value": f"#{rank}", "label": "Top research item"},
-        "fields": [
-            {"label": "Status", "value": "Published", "short": True},
-            {"label": "Date", "value": "2026-08-19", "short": True},
-        ],
-        "sections": [
-            {"title": "Summary", "content": "Verified contribution.", "collapsed": False},
-            {"title": "Why it matters", "content": "Improves agent memory.", "collapsed": True},
-            {"title": "Selection", "content": "Strong evidence.", "collapsed": True},
-        ],
+        "fields": fields,
+        "sections": sections,
         "source": {"label": "Primary source", "url": "https://example.com/paper"},
         "image_url": image_url,
     }
@@ -102,8 +149,26 @@ def semantic_card(
 
 def market_dashboard_cards() -> list[Dict[str, Any]]:
     cards = [semantic_card("market_dashboard", rank=index) for index in range(1, 4)]
-    cards[0]["tag"] = "盘面总览"
-    cards[0]["theme"] = "blue"
+    tags = ("盘面总览", "情绪与主线", "异动与风险")
+    themes = ("blue", "orange", "yellow")
+    focus_values = ("指数分化", "结构轮动", "关注炸板扩散")
+    for card, tag, theme, focus_value in zip(cards, tags, themes, focus_values):
+        card["tag"] = tag
+        card["theme"] = theme
+        card["focus"] = {"value": focus_value, "label": "已核验的阶段判断"}
+        titles = feishu_cards.MARKET_SECTION_TITLES_BY_TAG[tag]
+        card["sections"] = [
+            {
+                "title": title,
+                "content": (
+                    "指数、市场广度与成交共同支持当前阶段判断。"
+                    if index == 0
+                    else "详细证据、变化和核验边界。"
+                ),
+                "collapsed": index > 0,
+            }
+            for index, title in enumerate(titles)
+        ]
     cards[0]["fields"] = [
         {"label": label, "value": "已核验", "short": True}
         for label in (
@@ -116,10 +181,6 @@ def market_dashboard_cards() -> list[Dict[str, Any]]:
             "涨停 / 跌停 / 炸板",
         )
     ]
-    cards[1]["tag"] = "情绪与主线"
-    cards[1]["theme"] = "orange"
-    cards[2]["tag"] = "异动与风险"
-    cards[2]["theme"] = "yellow"
     return cards
 
 
@@ -141,13 +202,15 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertFalse(tasks["smoke-test"]["enabled"])
         self.assertTrue(tasks["a-share-monitor"]["enabled"])
 
-    def test_unchanged_task_c_prompt_is_byte_for_byte_migration(self) -> None:
-        expected = {
-            "agent-memory-frontier": "74230f5a1bcb92ab5b36148dd27ba677ffbdfc00531a0e147f928ee685ec8fbc",
-        }
-        for task_id, digest in expected.items():
-            value = (REPO_ROOT / "tasks" / task_id / "TASK.md").read_bytes()
-            self.assertEqual(digest, hashlib.sha256(value).hexdigest())
+    def test_task_c_prompt_requires_fast_chinese_paper_comprehension(self) -> None:
+        prompt = (
+            REPO_ROOT / "tasks" / "agent-memory-frontier" / "TASK.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Stage 1 — Build a broad candidate pool", prompt)
+        self.assertIn("Stage 2 — Independently validate", prompt)
+        self.assertIn("optimize only the Feishu card presentation", prompt)
+        for title in feishu_cards.RESEARCH_SECTION_TITLES:
+            self.assertIn(f"`{title}`", prompt)
 
     def test_a_share_prompt_monitors_every_configured_trigger(self) -> None:
         config = load_task_config(REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml")
@@ -157,12 +220,34 @@ class RepositoryContractTests(unittest.TestCase):
         for trigger in config["schedule"]["triggers"]:
             self.assertIn(f"`{trigger}`", prompt)
         self.assertEqual(
-            ["11:20", "15:01"], config["delivery"]["notification_triggers"]
+            ["09:35", "11:20", "15:01"],
+            config["delivery"]["notification_triggers"],
         )
+        self.assertIn("正常交易日这三个时点返回 `SUCCESS_NOTIFY`", prompt)
         self.assertIn("其余时点只采集和保存数据", prompt)
         self.assertIn("不得因为“尚未收盘”而跳过", prompt)
+        self.assertIn("股民首屏阅读优先级", prompt)
+        self.assertIn("红涨绿跌", prompt)
+        for titles in feishu_cards.MARKET_SECTION_TITLES_BY_TAG.values():
+            for title in titles:
+                self.assertIn(f"`{title}`", prompt)
         self.assertIn("SUCCESS_NOTIFY", prompt)
         self.assertIn("Deterministic workflow evidence", prompt)
+
+    def test_daily_archive_triggers_must_be_notification_enabled(self) -> None:
+        config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
+        config = load_task_config(config_path)
+        config["delivery"]["daily_archive"] = {
+            "enabled": True,
+            "trigger_slots": ["14:30"],
+        }
+
+        errors = validate_task_config(config, config_path, REPO_ROOT)
+
+        self.assertIn(
+            "delivery.daily_archive.trigger_slots must be a subset of delivery.notification_triggers: 14:30",
+            errors,
+        )
 
     def test_task_b_always_reports_daily_status(self) -> None:
         config = load_task_config(REPO_ROOT / "tasks" / "apple-price-monitor" / "task.yaml")
@@ -174,18 +259,37 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("不得因“首次建立基线”", prompt)
 
     def test_scheduler_has_exact_daily_slots_and_ignores_disabled_smoke(self) -> None:
-        tasks = {task["id"]: task for task in discover_tasks(REPO_ROOT)}
-        self.assertEqual(
-            ["09:20", "09:25", "09:35", "09:45", "11:20", "13:15", "14:30", "15:01"],
-            tasks["a-share-monitor"]["triggers"],
-        )
-        self.assertEqual(["10:00"], tasks["apple-price-monitor"]["triggers"])
-        self.assertEqual(["09:00"], tasks["agent-memory-frontier"]["triggers"])
+        with tempfile.TemporaryDirectory() as directory:
+            isolated_root = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", isolated_root / "tasks")
+            (isolated_root / "scripts").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "scripts" / "smoke_test.py",
+                isolated_root / "scripts" / "smoke_test.py",
+            )
+            tasks = {task["id"]: task for task in discover_tasks(isolated_root)}
+            self.assertEqual(
+                [
+                    "09:20",
+                    "09:25",
+                    "09:35",
+                    "09:45",
+                    "11:20",
+                    "13:15",
+                    "14:30",
+                    "15:01",
+                ],
+                tasks["a-share-monitor"]["triggers"],
+            )
+            self.assertEqual(["10:00"], tasks["apple-price-monitor"]["triggers"])
+            self.assertEqual(["09:00"], tasks["agent-memory-frontier"]["triggers"])
 
-        weekend = datetime(2026, 8, 22, 9, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
-        due = due_runs(REPO_ROOT, weekend)
-        self.assertIn("a-share-monitor", {item["task"] for item in due})
-        self.assertNotIn("smoke-test", {item["task"] for item in due})
+            weekend = datetime(
+                2026, 8, 22, 9, 20, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+            due = due_runs(isolated_root, weekend)
+            self.assertIn("a-share-monitor", {item["task"] for item in due})
+            self.assertNotIn("smoke-test", {item["task"] for item in due})
 
     def test_production_tasks_use_the_expected_card_profiles(self) -> None:
         expected = {
@@ -449,7 +553,11 @@ class ProductionRuntimeTests(unittest.TestCase):
         )
 
     def test_data_only_trigger_suppresses_notification_but_keeps_state(self) -> None:
-        self.config["delivery"]["notification_triggers"] = ["11:20", "15:01"]
+        self.config["delivery"]["notification_triggers"] = [
+            "09:35",
+            "11:20",
+            "15:01",
+        ]
         calls = []
         result = self.execute(
             structured_result(
@@ -458,7 +566,7 @@ class ProductionRuntimeTests(unittest.TestCase):
                 updates={"snapshot": {"breadth": "verified"}},
             ),
             sender=lambda *args, **kwargs: calls.append(kwargs),
-            trigger_slot="09:35",
+            trigger_slot="09:45",
         )
         state = read_json_object(self.state_path)
         self.assertEqual(SUCCESS_NO_NOTIFY, result["status"])
@@ -468,16 +576,190 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertEqual({}, state["_runtime"]["notifications"])
 
     def test_notification_trigger_requires_success_notify(self) -> None:
-        self.config["delivery"]["notification_triggers"] = ["11:20", "15:01"]
+        self.config["delivery"]["notification_triggers"] = [
+            "09:35",
+            "11:20",
+            "15:01",
+        ]
         result = self.execute(
             structured_result(SUCCESS_NO_NOTIFY),
-            trigger_slot="11:20",
+            trigger_slot="09:35",
         )
         self.assertEqual(FAILED, result["status"])
         self.assertIn("requires SUCCESS_NOTIFY", result["error"])
 
+    def test_opening_trigger_allows_fake_delivery(self) -> None:
+        self.config["delivery"]["notification_triggers"] = [
+            "09:35",
+            "11:20",
+            "15:01",
+        ]
+        calls = []
+        result = self.execute(
+            structured_result(
+                SUCCESS_NOTIFY,
+                event_key="market:2026-08-20:09:35",
+            ),
+            sender=lambda text, **kwargs: (
+                calls.append(kwargs)
+                or {"status": "ok", "message_id": "om_fake_opening"}
+            ),
+            trigger_slot="09:35",
+        )
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(1, len(calls))
+
+    def test_closing_review_is_pinned_after_all_original_cards_are_sent(self) -> None:
+        self.config["schedule"]["triggers"] = ["15:01"]
+        self.config["delivery"].update(
+            {
+                "presentation": "market_dashboard_card",
+                "notification_triggers": ["15:01"],
+                "daily_archive": {
+                    "enabled": True,
+                    "trigger_slots": ["15:01"],
+                },
+            }
+        )
+        events = []
+
+        def sender(text: str, **kwargs: Any) -> Dict[str, Any]:
+            message_id = f"om_close_{len(events) + 1}"
+            events.append(f"send:{message_id}")
+            return {"status": "ok", "message_id": message_id}
+
+        def pinner(message_id: str) -> Dict[str, Any]:
+            events.append(f"pin:{message_id}")
+            return {
+                "status": "ok",
+                "message_id": message_id,
+                "chat_id": "oc_market",
+                "create_time": "1787410860000",
+            }
+
+        with patch.object(production_runner, "pin_message", create=True, new=pinner):
+            result = self.execute(
+                structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="market:2026-08-19:15:01",
+                    cards=market_dashboard_cards(),
+                ),
+                sender=sender,
+                scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
+                trigger_slot="15:01",
+            )
+
+        state = read_json_object(self.state_path)
+        notification = next(iter(state["_runtime"]["notifications"].values()))
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(
+            [
+                "send:om_close_1",
+                "send:om_close_2",
+                "send:om_close_3",
+                "pin:om_close_1",
+            ],
+            events,
+        )
+        archive = notification["daily_archive"]
+        self.assertEqual("pinned", archive["status"])
+        self.assertEqual("om_close_1", archive["message_id"])
+        self.assertIsInstance(archive["pinned_at"], str)
+        self.assertIsNone(archive["last_error"])
+
+    def test_non_closing_review_does_not_create_a_daily_archive(self) -> None:
+        self.config["schedule"]["triggers"] = ["11:20", "15:01"]
+        self.config["delivery"].update(
+            {
+                "presentation": "market_dashboard_card",
+                "notification_triggers": ["11:20", "15:01"],
+                "daily_archive": {
+                    "enabled": True,
+                    "trigger_slots": ["15:01"],
+                },
+            }
+        )
+        sends = []
+
+        def must_not_pin(message_id: str) -> Dict[str, Any]:
+            raise AssertionError(f"unexpected Pin for {message_id}")
+
+        with patch.object(
+            production_runner, "pin_message", create=True, new=must_not_pin
+        ):
+            result = self.execute(
+                structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="market:2026-08-19:11:20",
+                    cards=market_dashboard_cards(),
+                ),
+                sender=lambda text, **kwargs: (
+                    sends.append(kwargs)
+                    or {"status": "ok", "message_id": f"om_midday_{len(sends)}"}
+                ),
+                scheduled_at=self.scheduled_at.replace(hour=11, minute=20),
+                trigger_slot="11:20",
+            )
+
+        state = read_json_object(self.state_path)
+        notification = next(iter(state["_runtime"]["notifications"].values()))
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(3, len(sends))
+        self.assertNotIn("daily_archive", notification)
+
+    def test_daily_archive_failure_never_breaks_original_card_delivery(self) -> None:
+        self.config["schedule"]["triggers"] = ["15:01"]
+        self.config["delivery"].update(
+            {
+                "presentation": "market_dashboard_card",
+                "notification_triggers": ["15:01"],
+                "daily_archive": {
+                    "enabled": True,
+                    "trigger_slots": ["15:01"],
+                },
+            }
+        )
+        sends = []
+
+        with patch.object(
+            production_runner,
+            "pin_message",
+            create=True,
+            side_effect=FeishuDeliveryError("missing Pin permission"),
+        ):
+            result = self.execute(
+                structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="market:2026-08-19:15:01",
+                    cards=market_dashboard_cards(),
+                ),
+                sender=lambda text, **kwargs: (
+                    sends.append(kwargs)
+                    or {"status": "ok", "message_id": f"om_close_{len(sends)}"}
+                ),
+                scheduled_at=self.scheduled_at.replace(hour=15, minute=1),
+                trigger_slot="15:01",
+            )
+
+        state = read_json_object(self.state_path)
+        notification = next(iter(state["_runtime"]["notifications"].values()))
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual("ok", result["delivery_status"])
+        self.assertEqual(3, len(sends))
+        self.assertEqual("sent", notification["status"])
+        archive = notification.get("daily_archive")
+        self.assertIsNotNone(archive)
+        self.assertEqual("failed", archive["status"])
+        self.assertIn(
+            "missing Pin permission", archive["last_error"]
+        )
+
     def test_recovery_suppresses_pending_notification_from_data_only_slot(self) -> None:
-        self.config["delivery"]["notification_triggers"] = ["11:20", "15:01"]
+        self.config["delivery"]["notification_triggers"] = [
+            "09:35",
+            "11:20",
+            "15:01",
+        ]
         state = read_json_object(self.state_path)
         state["_runtime"]["processed_runs"]["old-run"] = {
             "trigger_slot": "14:30",
@@ -707,25 +989,74 @@ class ProductionRuntimeTests(unittest.TestCase):
 
 
 class CardRenderingTests(unittest.TestCase):
+    def test_research_cards_require_chinese_summary_and_ordered_details(self) -> None:
+        cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
+        feishu_cards.validate_presentation(
+            "research_top5_cards", cards, should_notify=True
+        )
+
+        cards[0]["sections"][0]["content"] = "English abstract only."
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "substantive Chinese summary"
+        ):
+            feishu_cards.validate_presentation(
+                "research_top5_cards", cards, should_notify=True
+            )
+
+        cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
+        cards[0]["sections"][1], cards[0]["sections"][2] = (
+            cards[0]["sections"][2],
+            cards[0]["sections"][1],
+        )
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "sections must be ordered"
+        ):
+            feishu_cards.validate_presentation(
+                "research_top5_cards", cards, should_notify=True
+            )
+
+    def test_research_cards_require_visible_summary_and_research_metadata(self) -> None:
+        cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
+        cards[0]["sections"][0]["collapsed"] = True
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "one visible Chinese summary"
+        ):
+            feishu_cards.validate_presentation(
+                "research_top5_cards", cards, should_notify=True
+            )
+
+        cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
+        cards[0]["fields"] = cards[0]["fields"][:-1]
+        with self.assertRaisesRegex(feishu_cards.CardSpecError, "missing fields"):
+            feishu_cards.validate_presentation(
+                "research_top5_cards", cards, should_notify=True
+            )
+
     def test_card_2_structure_has_one_focus_and_grouped_details(self) -> None:
         card = feishu_cards.render_card(semantic_card("research_item", rank=1))
         self.assertEqual("2.0", card["schema"])
         self.assertEqual("default", card["config"]["width_mode"])
         tags = [element["tag"] for element in card["body"]["elements"]]
         self.assertEqual(
-            ["column_set", "markdown", "collapsible_panel", "button"], tags
+            ["markdown", "column_set", "collapsible_panel", "button"], tags
         )
-        focus_markdown = card["body"]["elements"][0]["columns"][0]["elements"][0]
+        focus_markdown = card["body"]["elements"][1]["columns"][0]["elements"][0]
         self.assertTrue(focus_markdown["content"].startswith("## "))
-        focus_column = card["body"]["elements"][0]["columns"][0]
+        focus_column = card["body"]["elements"][1]["columns"][0]
         self.assertNotIn("corner_radius", focus_column)
         button = card["body"]["elements"][-1]
         self.assertEqual("open_url", button["behaviors"][0]["type"])
         panel = card["body"]["elements"][2]
         self.assertFalse(panel["expanded"])
         self.assertEqual(
-            "详细数据（点击展开/收起）", panel["header"]["title"]["content"]
+            "论文详解（点击展开/收起）", panel["header"]["title"]["content"]
         )
+        self.assertIn("中文摘要", card["body"]["elements"][0]["content"])
+        self.assertEqual(4, len(panel["elements"]))
+        for element, title in zip(
+            panel["elements"], feishu_cards.RESEARCH_SECTION_TITLES[1:]
+        ):
+            self.assertIn(title, element["content"])
 
     def test_market_card_requires_hidden_detail_section(self) -> None:
         cards = market_dashboard_cards()
@@ -733,7 +1064,7 @@ class CardRenderingTests(unittest.TestCase):
             {"title": "Summary", "content": "Only a summary.", "collapsed": False}
         ]
         with self.assertRaisesRegex(
-            feishu_cards.CardSpecError, "requires a collapsed detail section"
+            feishu_cards.CardSpecError, "requires one visible and two collapsed sections"
         ):
             feishu_cards.validate_presentation(
                 "market_dashboard_card", cards, should_notify=True
@@ -746,6 +1077,14 @@ class CardRenderingTests(unittest.TestCase):
         )
         for card in cards:
             rendered = feishu_cards.render_card(card)
+            self.assertEqual(
+                ["markdown", "column_set", "collapsible_panel", "button"],
+                [element["tag"] for element in rendered["body"]["elements"]],
+            )
+            self.assertIn(
+                card["sections"][0]["title"],
+                rendered["body"]["elements"][0]["content"],
+            )
             self.assertEqual("button", rendered["body"]["elements"][-1]["tag"])
             self.assertEqual(
                 "open_url",
@@ -758,10 +1097,47 @@ class CardRenderingTests(unittest.TestCase):
             ]
             self.assertEqual(1, len(panels))
             self.assertFalse(panels[0]["expanded"])
+            self.assertEqual(
+                "证据详情（点击展开/收起）",
+                panels[0]["header"]["title"]["content"],
+            )
 
+        cards[0]["theme"] = "green"
+        cards[1]["theme"] = "red"
+        feishu_cards.validate_presentation(
+            "market_dashboard_card", cards, should_notify=True
+        )
+
+        cards[0]["theme"] = "orange"
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "盘面总览 theme must be one of"
+        ):
+            feishu_cards.validate_presentation(
+                "market_dashboard_card", cards, should_notify=True
+            )
+
+        cards = market_dashboard_cards()
+        cards[1]["theme"] = "blue"
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "情绪与主线 theme must be one of"
+        ):
+            feishu_cards.validate_presentation(
+                "market_dashboard_card", cards, should_notify=True
+            )
+
+        cards = market_dashboard_cards()
         cards[2]["theme"] = "red"
         with self.assertRaisesRegex(
-            feishu_cards.CardSpecError, "risk card theme must be yellow"
+            feishu_cards.CardSpecError, "异动与风险 theme must be one of: yellow"
+        ):
+            feishu_cards.validate_presentation(
+                "market_dashboard_card", cards, should_notify=True
+            )
+
+        cards = market_dashboard_cards()
+        cards[1]["sections"][1]["title"] = "主线详情"
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "sections must be ordered as"
         ):
             feishu_cards.validate_presentation(
                 "market_dashboard_card", cards, should_notify=True
@@ -769,7 +1145,12 @@ class CardRenderingTests(unittest.TestCase):
 
     def test_card_renderer_rejects_undocumented_component_fields(self) -> None:
         card = feishu_cards.render_card(semantic_card("research_item", rank=1))
-        card["body"]["elements"][0]["columns"][0]["corner_radius"] = "8px"
+        column_set = next(
+            element
+            for element in card["body"]["elements"]
+            if element["tag"] == "column_set"
+        )
+        column_set["columns"][0]["corner_radius"] = "8px"
         with self.assertRaisesRegex(
             feishu_cards.CardSpecError, "unsupported column fields: corner_radius"
         ):
@@ -779,7 +1160,7 @@ class CardRenderingTests(unittest.TestCase):
         spec = semantic_card("research_item", rank=1)
         spec["sections"][0]["content"] = "<at id=all></at> **unsafe**"
         card = feishu_cards.render_card(spec)
-        content = card["body"]["elements"][1]["content"]
+        content = card["body"]["elements"][0]["content"]
         self.assertNotIn("<at", content)
         self.assertIn("&lt;at", content)
 
@@ -789,6 +1170,43 @@ class CardRenderingTests(unittest.TestCase):
 
 
 class AdapterAndRetryTests(unittest.TestCase):
+    def test_feishu_adapter_pins_a_sent_message(self) -> None:
+        responses = [
+            {"code": 0, "tenant_access_token": "tenant-token"},
+            {
+                "code": 0,
+                "data": {
+                    "pin": {
+                        "message_id": "om_daily_close",
+                        "chat_id": "oc_market",
+                        "operator_id": "cli_app",
+                        "operator_id_type": "app_id",
+                        "create_time": "1787410860000",
+                    }
+                },
+            },
+        ]
+        env = {
+            feishu_send.APP_ID_ENV_KEY: "app-id",
+            feishu_send.APP_SECRET_ENV_KEY: "app-secret",
+        }
+        pin_operation = getattr(feishu_send, "pin_message", lambda message_id: None)
+        with patch.dict(os.environ, env, clear=False), patch.object(
+            feishu_send, "_request_json", side_effect=responses
+        ) as request:
+            result = pin_operation("om_daily_close")
+
+        self.assertIsNotNone(result)
+        self.assertEqual("om_daily_close", result["message_id"])
+        self.assertEqual(
+            "https://open.feishu.cn/open-apis/im/v1/pins",
+            request.call_args_list[1].args[0],
+        )
+        self.assertEqual(
+            {"message_id": "om_daily_close"},
+            request.call_args_list[1].args[1],
+        )
+
     def test_feishu_adapter_forwards_uuid_without_real_network(self) -> None:
         responses = [
             {"code": 0, "tenant_access_token": "tenant-token"},

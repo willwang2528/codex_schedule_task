@@ -27,7 +27,10 @@ delivery:
   enabled: true
   target: configured_chat
   chat_id_env: FEISHU_CHAT_ID_A_SHARE_MONITOR_SCHEDULE_TASK
-  notification_triggers: ["11:20", "15:01"]
+  notification_triggers: ["09:35", "11:20", "15:01"]
+  daily_archive:
+    enabled: true
+    trigger_slots: ["15:01"]
   policy: conditional
   presentation: market_dashboard_card
   retry_attempts: 2

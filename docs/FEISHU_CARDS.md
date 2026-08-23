@@ -7,12 +7,14 @@ Automation Hub uses Feishu Card 2.0 for production notifications. The Agent retu
 | Task | `delivery.presentation` | Delivery shape |
 | --- | --- | --- |
 | Agent Memory | `research_top5_cards` | Exactly five independent cards, one per ranked paper |
-| A-share monitor | `market_dashboard_card` | Exactly three cards: blue overview, orange sentiment/mainline, yellow anomaly/risk |
+| A-share monitor | `market_dashboard_card` | Exactly three cards: direction-colored overview, profit/loss-colored sentiment/mainline, yellow anomaly/risk |
 | Apple price monitor | `price_alert_cards` | One card per qualifying SKU/offer, maximum five |
 
 `SUCCESS_NO_NOTIFY` and `SKIPPED` always carry an empty card array and send nothing.
 
-Task A separately configures `delivery.notification_triggers: ["11:20", "15:01"]`. All other market slots still collect and persist evidence, but the Harness deterministically clears attempted notification fields and never calls the Feishu adapter. Pending notification recovery enforces the same allowlist.
+Task A separately configures `delivery.notification_triggers: ["09:35", "11:20", "15:01"]`. All other market slots still collect and persist evidence, but the Harness deterministically clears attempted notification fields and never calls the Feishu adapter. Pending notification recovery enforces the same allowlist.
+
+Task A also enables `delivery.daily_archive` only for `15:01`. After all three original cards are delivered, the Harness Pins the first `盘面总览` card. The group-wide Pin list therefore contains one closing-review entry per trading day; selecting it returns the reader to the three adjacent closing cards. Pin failure is stored under the notification's `daily_archive` state and never downgrades successful card delivery.
 
 ## Semantic card contract
 
@@ -21,13 +23,17 @@ Each card contains:
 - template, title, subtitle, theme, and status tag
 - one primary focus metric
 - up to eight aligned label/value fields
-- one to three grouped sections
+- one to five grouped sections, with profile-specific limits
 - a verified primary-source link
 - an optional public HTTPS image URL
 
 The renderer applies Card 2.0 hierarchy, spacing, color, focus, grouping, truncation, dark/light-safe defaults, and a source button. Dynamic text is escaped so Agent output cannot inject mentions or card markup. Every rendered component is checked against a per-component field allowlist before delivery, preventing unsupported style properties from reaching the Feishu API.
 
-For the three-card market profile, each card has exactly one visible conclusion followed by two sections inside a default-collapsed panel. The verified source button remains the final body element. Card 1 must expose the four indices, turnover, breadth, and limit activity in the first view; full OHLC, ladders, movers, timing, scope, conflicts, and missing-field explanations stay in details.
+For the Agent Memory profile, every card places one visible `中文摘要` first in the body, followed by rank and metadata, then four sections in a default-collapsed `论文详解` panel: `现存问题` → `已有方法的不足` → `当前方法为什么可行` → `未来展望`. The summary must independently establish the paper's problem, mechanism, evidence, and material boundary. Agent Memory relevance and selection rationale remain concise visible fields. This is a presentation contract only; candidate search, source verification, filtering, and Top 5 ranking are unchanged.
+
+For the three-card market profile, the visible conclusion is the first body element, followed by the focus/field block, two detail sections inside a default-collapsed `证据详情` panel, and the final verified-source button. The fixed section sets are `盘面结论 / 指数与阶段变化 / 数据口径与核验`, `情绪与主线结论 / 梯队、代表股与驱动 / 持续性与证据边界`, and `风险与验证结论 / 异动与风险证据 / 待验证清单与数据口径`. Card 1 exposes the four indices, turnover, breadth, and limit activity; full OHLC, ladders, movers, timing, scope, conflicts, and missing-field explanations stay in details.
+
+Market colors follow the user-facing Chinese-market convention while preserving text labels: clear broad rise / broad money-making uses red, clear broad fall / broad loss effect uses green, mixed or flat overview uses blue, rotation/divergence uses orange, insufficient evidence uses grey, and the risk card remains yellow. Every change still includes a sign, number, and direction word so meaning never depends on color alone.
 
 ## Images
 

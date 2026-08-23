@@ -77,6 +77,8 @@ delivery:
   # chat_id_env: FEISHU_CHAT_ID_EXAMPLE_TASK_SCHEDULE_TASK
   # Optional hard allowlist: all schedule slots still run, only these may notify:
   # notification_triggers: ["09:00"]
+  # Optional best-effort group Pin archive for selected notification slots:
+  # daily_archive: {"enabled": true, "trigger_slots": ["15:01"]}
   policy: conditional
   presentation: post
   retry_attempts: 2

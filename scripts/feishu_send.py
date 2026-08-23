@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 
 AUTH_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 MESSAGE_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
+PIN_URL = "https://open.feishu.cn/open-apis/im/v1/pins"
 IMAGE_URL = "https://open.feishu.cn/open-apis/im/v1/images"
 MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
 APP_ID_ENV_KEY = "FEISHU_APP_ID_SCHEDULE_TASK"
@@ -371,6 +372,52 @@ def send_message(
         )
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     return {"status": "ok", "message_id": data.get("message_id")}
+
+
+def pin_message(message_id: str) -> Dict[str, Any]:
+    """Pin one visible Feishu message without changing its delivery status."""
+
+    if not isinstance(message_id, str) or not message_id.strip():
+        raise FeishuDeliveryError("pin message_id must be a non-empty string")
+    if not all(os.environ.get(key) for key in (APP_ID_ENV_KEY, APP_SECRET_ENV_KEY)):
+        load_local_feishu_env()
+    app_id = os.environ.get(APP_ID_ENV_KEY, "")
+    app_secret = os.environ.get(APP_SECRET_ENV_KEY, "")
+    if not app_id or not app_secret:
+        raise FeishuDeliveryError(
+            "missing Feishu environment variables: "
+            + ", ".join(
+                key
+                for key, value in (
+                    (APP_ID_ENV_KEY, app_id),
+                    (APP_SECRET_ENV_KEY, app_secret),
+                )
+                if not value
+            )
+        )
+
+    tenant_token = _get_tenant_access_token(app_id, app_secret)
+    result = _request_json(
+        PIN_URL,
+        {"message_id": message_id.strip()},
+        bearer_token=tenant_token,
+    )
+    if result.get("code") != 0:
+        raise FeishuDeliveryError(
+            f"Feishu Pin failed: code={result.get('code')} "
+            f"message={_safe_api_message(result.get('msg', 'unknown'))}"
+        )
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    pin = data.get("pin") if isinstance(data.get("pin"), dict) else {}
+    pinned_message_id = pin.get("message_id")
+    if not isinstance(pinned_message_id, str) or not pinned_message_id:
+        raise FeishuDeliveryError("Feishu Pin returned no message_id")
+    return {
+        "status": "ok",
+        "message_id": pinned_message_id,
+        "chat_id": pin.get("chat_id"),
+        "create_time": pin.get("create_time"),
+    }
 
 
 def main() -> int:

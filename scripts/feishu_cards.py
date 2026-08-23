@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import html
+import re
 from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 
@@ -52,24 +53,35 @@ PROFILE_INSTRUCTIONS = {
     "research_top5_cards": (
         "For SUCCESS_NOTIFY, notification.cards must contain exactly five "
         "research_item cards in the same rank order as the Top 5. Use one card per "
-        "paper: focus.value is #1 through #5; fields include date and status; "
-        "sections cover summary, Agent Memory relevance, and selection rationale; "
+        "paper or verified research release: focus.value is #1 through #5; fields "
+        "are labelled 日期, 状态, Agent Memory 相关性, and 入选理由. Each card "
+        "has exactly five ordered sections: one visible 中文摘要 followed by four "
+        "collapsed sections titled 现存问题, 已有方法的不足, "
+        "当前方法为什么可行, and 未来展望. The Chinese summary explains "
+        "the problem, mechanism, strongest evidence, and material boundary in 3-4 "
+        "sentences. Keep every claim grounded in the primary source; clearly label "
+        "editor inference in 未来展望 and state when evidence is insufficient. "
         "source is the verified primary URL; image_url is a verified HTTPS research "
         "or project image when available, otherwise an empty string."
     ),
     "market_dashboard_card": (
         "For a normal trading-session SUCCESS_NOTIFY, notification.cards must contain "
-        "exactly three market_dashboard cards in this order: (1) tag 盘面总览 with "
-        "theme blue, (2) tag 情绪与主线 with theme "
-        "orange, and (3) tag 异动与风险 with theme yellow. Card 1 visible fields must "
-        "include 上证指数, 深证成指, "
+        "exactly three market_dashboard cards in this order: (1) tag 盘面总览 using "
+        "theme red for a clear broad rise, green for a clear broad fall, blue for a "
+        "mixed/flat market, or grey when evidence is insufficient; (2) tag 情绪与主线 "
+        "using red for broad money-making, green for broad loss effect, orange for "
+        "rotation/divergence, or grey when evidence is insufficient; and (3) tag "
+        "异动与风险 with theme yellow. Card 1 visible fields must include 上证指数, 深证成指, "
         "创业板指, 科创50, 沪深成交额, 上涨 / 下跌 / 平盘, and 涨停 / 跌停 / 炸板. "
-        "Each normal card has exactly three sections: one short collapsed=false "
-        "conclusion followed by two collapsed=true detail sections. Put the most "
-        "decision-relevant metric in focus, keep secondary evidence in the collapsed "
-        "panel, retain one verified source URL per card, and use Chinese-market red-up "
-        "green-down semantics. Never replace non-empty deterministic market evidence "
-        "with a blanket unverifiable label."
+        "Each card has exactly the three ordered sections required for its tag: "
+        "盘面结论 / 指数与阶段变化 / 数据口径与核验; 情绪与主线结论 / "
+        "梯队、代表股与驱动 / 持续性与证据边界; or 风险与验证结论 / "
+        "异动与风险证据 / 待验证清单与数据口径. The first section is visible and "
+        "answers the investor's main question in 2-3 short Chinese sentences; the other "
+        "two sections are collapsed details. Put the most decision-relevant metric in "
+        "focus, retain one verified source URL per card, and use Chinese-market red-up "
+        "green-down semantics. Never infer a strong market from one isolated metric or "
+        "replace non-empty deterministic market evidence with a blanket unverifiable label."
     ),
     "price_alert_cards": (
         "For every successful daily run, notification.cards must contain one to five "
@@ -80,6 +92,42 @@ PROFILE_INSTRUCTIONS = {
         "is an exact checked offer or official storefront URL. Never merge materially "
         "different offer conditions into one card."
     ),
+}
+
+RESEARCH_SECTION_TITLES = (
+    "中文摘要",
+    "现存问题",
+    "已有方法的不足",
+    "当前方法为什么可行",
+    "未来展望",
+)
+RESEARCH_REQUIRED_FIELD_LABELS = {
+    "日期",
+    "状态",
+    "Agent Memory 相关性",
+    "入选理由",
+}
+MARKET_SECTION_TITLES_BY_TAG = {
+    "盘面总览": (
+        "盘面结论",
+        "指数与阶段变化",
+        "数据口径与核验",
+    ),
+    "情绪与主线": (
+        "情绪与主线结论",
+        "梯队、代表股与驱动",
+        "持续性与证据边界",
+    ),
+    "异动与风险": (
+        "风险与验证结论",
+        "异动与风险证据",
+        "待验证清单与数据口径",
+    ),
+}
+MARKET_ALLOWED_THEMES_BY_TAG = {
+    "盘面总览": {"red", "green", "blue", "grey"},
+    "情绪与主线": {"red", "green", "orange", "grey"},
+    "异动与风险": {"yellow"},
 }
 
 # Card 2.0 component fields used by this renderer. Keep this allowlist aligned
@@ -255,8 +303,8 @@ def validate_card_specs(value: Any) -> List[Dict[str, Any]]:
                 raise CardSpecError(f"{field_path}.short must be boolean")
 
         sections = item["sections"]
-        if not isinstance(sections, list) or not 1 <= len(sections) <= 3:
-            raise CardSpecError(f"{path}.sections must contain 1 to 3 items")
+        if not isinstance(sections, list) or not 1 <= len(sections) <= 5:
+            raise CardSpecError(f"{path}.sections must contain 1 to 5 items")
         for section_index, section in enumerate(sections):
             section_path = f"{path}.sections[{section_index}]"
             if not isinstance(section, dict) or set(section) != {
@@ -327,14 +375,36 @@ def validate_presentation(
                 raise CardSpecError(
                     "research_top5_cards focus values must be #1 through #5 in order"
                 )
-    if presentation == "market_dashboard_card":
-        for index, card in enumerate(cards, start=1):
-            if len(card["sections"]) < 2 or not any(
-                section["collapsed"] for section in card["sections"]
+            sections = card["sections"]
+            titles = tuple(section["title"].strip() for section in sections)
+            if titles != RESEARCH_SECTION_TITLES:
+                raise CardSpecError(
+                    "research_top5_cards sections must be ordered as: "
+                    + ", ".join(RESEARCH_SECTION_TITLES)
+                )
+            if sections[0]["collapsed"] or any(
+                not section["collapsed"] for section in sections[1:]
             ):
                 raise CardSpecError(
-                    f"market_dashboard_card card {index} requires a collapsed detail section"
+                    "research_top5_cards requires one visible Chinese summary and four collapsed detail sections"
                 )
+            chinese_characters = re.findall(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", sections[0]["content"]
+            )
+            if len(chinese_characters) < 20:
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} requires a substantive Chinese summary"
+                )
+            field_labels = {field["label"].strip() for field in card["fields"]}
+            missing_labels = sorted(
+                RESEARCH_REQUIRED_FIELD_LABELS.difference(field_labels)
+            )
+            if missing_labels:
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} missing fields: "
+                    + ", ".join(missing_labels)
+                )
+    if presentation == "market_dashboard_card":
         expected_tags = ("盘面总览", "情绪与主线", "异动与风险")
         for index, (card, expected_tag) in enumerate(
             zip(cards, expected_tags), start=1
@@ -350,18 +420,19 @@ def validate_presentation(
                 raise CardSpecError(
                     f"market_dashboard_card card {index} requires one visible and two collapsed sections"
                 )
-        if cards[0]["theme"] != "blue":
-            raise CardSpecError(
-                "market_dashboard_card overview theme must be blue"
-            )
-        if cards[1]["theme"] != "orange":
-            raise CardSpecError(
-                "market_dashboard_card sentiment card theme must be orange"
-            )
-        if cards[2]["theme"] != "yellow":
-            raise CardSpecError(
-                "market_dashboard_card risk card theme must be yellow"
-            )
+            titles = tuple(section["title"].strip() for section in sections)
+            expected_titles = MARKET_SECTION_TITLES_BY_TAG[expected_tag]
+            if titles != expected_titles:
+                raise CardSpecError(
+                    f"market_dashboard_card card {index} sections must be ordered as: "
+                    + ", ".join(expected_titles)
+                )
+            allowed_themes = MARKET_ALLOWED_THEMES_BY_TAG[expected_tag]
+            if card["theme"] not in allowed_themes:
+                allowed = ", ".join(sorted(allowed_themes))
+                raise CardSpecError(
+                    f"market_dashboard_card {expected_tag} theme must be one of: {allowed}"
+                )
         overview_labels = {field["label"] for field in cards[0]["fields"]}
         required_overview_labels = {
             "上证指数",
@@ -378,6 +449,12 @@ def validate_presentation(
                 "market_dashboard_card overview missing visible fields: "
                 + ", ".join(missing_labels)
             )
+    if presentation == "price_alert_cards":
+        for index, card in enumerate(cards, start=1):
+            if len(card["sections"]) > 3:
+                raise CardSpecError(
+                    f"price_alert_cards card {index} supports at most three sections"
+                )
 
 
 def presentation_instruction(presentation: str) -> str:
@@ -526,38 +603,38 @@ def render_card(spec: Dict[str, Any], *, image_key: str = "") -> Dict[str, Any]:
                 ],
             }
         )
-    elements.append(
-        {
-            "tag": "column_set",
-            "flex_mode": "none",
-            "margin": "0px 0px 12px 0px",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "background_style": background,
-                    "padding": "12px",
-                    "vertical_spacing": "4px",
-                    "elements": focus_elements,
-                }
-            ],
-        }
-    )
+    focus_block = {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "margin": "0px 0px 12px 0px",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "background_style": background,
+                "padding": "12px",
+                "vertical_spacing": "4px",
+                "elements": focus_elements,
+            }
+        ],
+    }
 
     sections = card["sections"]
     primary = next((item for item in sections if not item["collapsed"]), sections[0])
-    elements.append(
-        {
-            "tag": "markdown",
-            "content": (
-                f"**{_md(primary['title'], 60)}**\n"
-                f"{_md(primary['content'], 900)}"
-            ),
-            "text_size": "normal",
-            "margin": "0px 0px 12px 0px",
-        }
-    )
+    primary_block = {
+        "tag": "markdown",
+        "content": (
+            f"**{_md(primary['title'], 60)}**\n"
+            f"{_md(primary['content'], 900)}"
+        ),
+        "text_size": "normal",
+        "margin": "0px 0px 12px 0px",
+    }
+    if card["template"] in {"research_item", "market_dashboard"}:
+        elements.extend((primary_block, focus_block))
+    else:
+        elements.extend((focus_block, primary_block))
     secondary = [item for item in sections if item is not primary]
     if secondary:
         elements.append(
@@ -571,7 +648,15 @@ def render_card(spec: Dict[str, Any], *, image_key: str = "") -> Dict[str, Any]:
                 "header": {
                     "title": {
                         "tag": "plain_text",
-                        "content": "详细数据（点击展开/收起）",
+                        "content": (
+                            "论文详解（点击展开/收起）"
+                            if card["template"] == "research_item"
+                            else (
+                                "证据详情（点击展开/收起）"
+                                if card["template"] == "market_dashboard"
+                                else "详细数据（点击展开/收起）"
+                            )
+                        ),
                     },
                     "width": "fill",
                     "icon": {

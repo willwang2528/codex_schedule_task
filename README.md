@@ -73,9 +73,9 @@ FEISHU_CHAT_ID_SCHEDULE_TASK
 
 任务默认使用 `FEISHU_CHAT_ID_SCHEDULE_TASK`。需要单独群聊时，在该任务的 `delivery.chat_id_env` 指定形如 `FEISHU_CHAT_ID_<TASK>_SCHEDULE_TASK` 的本地变量；App ID 与 App Secret 仍复用上述两个全局变量。
 
-需要“所有时点采集、仅部分时点通知”时，在 `delivery.notification_triggers` 设置通知白名单。Task A 固定为 `["11:20", "15:01"]`；其他时点仍生成输出和状态，但 Harness 不创建或恢复飞书通知。
+需要“所有时点采集、仅部分时点通知”时，在 `delivery.notification_triggers` 设置通知白名单。Task A 固定为 `["09:35", "11:20", "15:01"]`；其他时点仍生成输出和状态，但 Harness 不创建或恢复飞书通知。
 
-正式通知使用 Feishu Card 2.0：Agent Memory 固定五张研究卡，A 股正常交易日使用“盘面总览—情绪与主线—异动与风险”三张渐进式市场卡，Apple 使用逐 SKU 价格卡。A 股竞品调研与取舍见 [A 股分析产品复盘调研](docs/A_SHARE_COMPETITIVE_REVIEW.md)，实现与降级策略见 [飞书卡片投递](docs/FEISHU_CARDS.md)。
+正式通知使用 Feishu Card 2.0：Agent Memory 固定五张研究卡，每张默认展示中文摘要，展开后按“现存问题—已有方法的不足—当前方法为什么可行—未来展望”快速浏览；A 股正常交易日使用“盘面总览—情绪与主线—异动与风险”三张渐进式市场卡，Apple 使用逐 SKU 价格卡。Agent Memory 卡片调研与取舍见 [论文速览卡片调研](docs/AGENT_MEMORY_PAPER_CARD_REVIEW.md)，A 股竞品调研与取舍见 [A 股分析产品复盘调研](docs/A_SHARE_COMPETITIVE_REVIEW.md)，实现与降级策略见 [飞书卡片投递](docs/FEISHU_CARDS.md)。
 
 ## 新增任务
 

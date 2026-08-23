@@ -45,7 +45,9 @@ The Feishu module automatically loads these namespaced keys from the ignored loc
 
 All tasks share the same App ID and App Secret. A task may override only its destination by setting `delivery.chat_id_env` to a namespaced local variable such as `FEISHU_CHAT_ID_A_SHARE_MONITOR_SCHEDULE_TASK`; tasks without this field continue using `FEISHU_CHAT_ID_SCHEDULE_TASK`.
 
-Task A also uses `delivery.notification_triggers: ["11:20", "15:01"]`. Its other six daily slots remain active data runs, but cannot create, send, or recover a Feishu notification.
+Task A also uses `delivery.notification_triggers: ["09:35", "11:20", "15:01"]`. Its other five daily slots remain active data runs, but cannot create, send, or recover a Feishu notification.
+
+Its optional daily archive Pins the first successfully delivered `15:01` card only after all three closing cards are sent. This is deliberately best-effort: a Pin permission or network error is recorded separately and does not make the original notification fail.
 
 缺少配置时，真正需要通知的执行会保留 pending notification 并返回明确失败；补齐配置后可用以下命令恢复，不重复研究：
 
