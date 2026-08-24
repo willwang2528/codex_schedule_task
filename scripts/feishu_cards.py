@@ -53,13 +53,18 @@ PROFILE_INSTRUCTIONS = {
     "research_top5_cards": (
         "For SUCCESS_NOTIFY, notification.cards must contain exactly five "
         "research_item cards in the same rank order as the Top 5. Use one card per "
-        "paper or verified research release: focus.value is #1 through #5; fields "
+        "paper or verified research release. title is the exact original-language "
+        "paper title and subtitle is its accurate Chinese translation; focus.value "
+        "is #1 through #5; fields "
         "are labelled 日期, 状态, Agent Memory 相关性, and 入选理由. Each card "
-        "has exactly five ordered sections: one visible 中文摘要 followed by four "
-        "collapsed sections titled 现存问题, 已有方法的不足, "
-        "当前方法为什么可行, and 未来展望. The Chinese summary explains "
-        "the problem, mechanism, strongest evidence, and material boundary in 3-4 "
-        "sentences. Keep every claim grounded in the primary source; clearly label "
+        "has exactly six ordered sections: one visible 一句话概述 followed by five "
+        "collapsed sections titled 论文摘要翻译, 现存问题, 已有方法的不足, "
+        "当前方法为什么可行, and 未来展望. The one-sentence overview is based "
+        "on the checked full text and states only the problem and how the work "
+        "addresses it; omit all experimental data, metrics, benchmark scores, and "
+        "result claims. The abstract translation faithfully translates the source "
+        "abstract and is the first item in the detail panel. Keep every claim grounded "
+        "in the primary source; clearly label "
         "editor inference in 未来展望 and state when evidence is insufficient. "
         "source is the verified primary URL; image_url is a verified HTTPS research "
         "or project image when available, otherwise an empty string."
@@ -95,7 +100,8 @@ PROFILE_INSTRUCTIONS = {
 }
 
 RESEARCH_SECTION_TITLES = (
-    "中文摘要",
+    "一句话概述",
+    "论文摘要翻译",
     "现存问题",
     "已有方法的不足",
     "当前方法为什么可行",
@@ -303,8 +309,8 @@ def validate_card_specs(value: Any) -> List[Dict[str, Any]]:
                 raise CardSpecError(f"{field_path}.short must be boolean")
 
         sections = item["sections"]
-        if not isinstance(sections, list) or not 1 <= len(sections) <= 5:
-            raise CardSpecError(f"{path}.sections must contain 1 to 5 items")
+        if not isinstance(sections, list) or not 1 <= len(sections) <= 6:
+            raise CardSpecError(f"{path}.sections must contain 1 to 6 items")
         for section_index, section in enumerate(sections):
             section_path = f"{path}.sections[{section_index}]"
             if not isinstance(section, dict) or set(section) != {
@@ -386,14 +392,47 @@ def validate_presentation(
                 not section["collapsed"] for section in sections[1:]
             ):
                 raise CardSpecError(
-                    "research_top5_cards requires one visible Chinese summary and four collapsed detail sections"
+                    "research_top5_cards requires one visible overview and five collapsed detail sections"
                 )
-            chinese_characters = re.findall(
-                r"[\u3400-\u4dbf\u4e00-\u9fff]", sections[0]["content"]
-            )
-            if len(chinese_characters) < 20:
+            if not re.search(r"[A-Za-z]", card["title"]):
                 raise CardSpecError(
-                    f"research_top5_cards card {rank} requires a substantive Chinese summary"
+                    f"research_top5_cards card {rank} requires the original-language paper title"
+                )
+            translated_title_characters = re.findall(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", card["subtitle"]
+            )
+            if len(translated_title_characters) < 4:
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} requires a Chinese title translation"
+                )
+            overview = sections[0]["content"].strip()
+            overview_chinese_characters = re.findall(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", overview
+            )
+            if len(overview_chinese_characters) < 20:
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} requires a substantive Chinese one-sentence overview"
+                )
+            if len(re.findall(r"[。！？!?]", overview)) != 1 or not re.search(
+                r"[。！？!?]$", overview
+            ):
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} overview must be exactly one sentence"
+                )
+            if re.search(
+                r"[0-9０-９%％]|实验|基准|数据集|成功率|准确率|召回率|得分|"
+                r"提升|提高|优于|超过|降低至|结果显示",
+                overview,
+            ):
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} overview must omit experimental data and result claims"
+                )
+            abstract_characters = re.findall(
+                r"[\u3400-\u4dbf\u4e00-\u9fff]", sections[1]["content"]
+            )
+            if len(abstract_characters) < 40:
+                raise CardSpecError(
+                    f"research_top5_cards card {rank} requires a substantive Chinese abstract translation"
                 )
             field_labels = {field["label"].strip() for field in card["fields"]}
             missing_labels = sorted(

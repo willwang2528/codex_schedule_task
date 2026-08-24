@@ -8,7 +8,7 @@ Automation Hub uses Feishu Card 2.0 for production notifications. The Agent retu
 | --- | --- | --- |
 | Agent Memory | `research_top5_cards` | Exactly five independent cards, one per ranked paper |
 | A-share monitor | `market_dashboard_card` | Exactly three cards: direction-colored overview, profit/loss-colored sentiment/mainline, yellow anomaly/risk |
-| Apple price monitor | `price_alert_cards` | One card per qualifying SKU/offer, maximum five |
+| Apple price monitor (disabled) | `price_alert_cards` | Task and delivery are disabled; retained only for possible future reactivation |
 
 `SUCCESS_NO_NOTIFY` and `SKIPPED` always carry an empty card array and send nothing.
 
@@ -23,13 +23,13 @@ Each card contains:
 - template, title, subtitle, theme, and status tag
 - one primary focus metric
 - up to eight aligned label/value fields
-- one to five grouped sections, with profile-specific limits
+- one to six grouped sections, with profile-specific limits
 - a verified primary-source link
 - an optional public HTTPS image URL
 
 The renderer applies Card 2.0 hierarchy, spacing, color, focus, grouping, truncation, dark/light-safe defaults, and a source button. Dynamic text is escaped so Agent output cannot inject mentions or card markup. Every rendered component is checked against a per-component field allowlist before delivery, preventing unsupported style properties from reaching the Feishu API.
 
-For the Agent Memory profile, every card places one visible `中文摘要` first in the body, followed by rank and metadata, then four sections in a default-collapsed `论文详解` panel: `现存问题` → `已有方法的不足` → `当前方法为什么可行` → `未来展望`. The summary must independently establish the paper's problem, mechanism, evidence, and material boundary. Agent Memory relevance and selection rationale remain concise visible fields. This is a presentation contract only; candidate search, source verification, filtering, and Top 5 ranking are unchanged.
+For the Agent Memory profile, the card header shows the exact original paper title and its Chinese translation. The first visible body section is `一句话概述`: one sentence based on the full text that states only the problem and method, without experimental data or result claims. The default-collapsed `论文详解` panel then starts with `论文摘要翻译`, followed by the existing sections `现存问题` → `已有方法的不足` → `当前方法为什么可行` → `未来展望`. Agent Memory relevance and selection rationale remain concise visible fields. This is a presentation contract only; candidate search, source verification, filtering, and Top 5 ranking are unchanged.
 
 For the three-card market profile, the visible conclusion is the first body element, followed by the focus/field block, two detail sections inside a default-collapsed `证据详情` panel, and the final verified-source button. The fixed section sets are `盘面结论 / 指数与阶段变化 / 数据口径与核验`, `情绪与主线结论 / 梯队、代表股与驱动 / 持续性与证据边界`, and `风险与验证结论 / 异动与风险证据 / 待验证清单与数据口径`. Card 1 exposes the four indices, turnover, breadth, and limit activity; full OHLC, ladders, movers, timing, scope, conflicts, and missing-field explanations stay in details.
 

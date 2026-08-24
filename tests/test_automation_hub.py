@@ -34,6 +34,7 @@ from task_runtime import (
     SUCCESS_NO_NOTIFY,
     SUCCESS_NOTIFY,
     atomic_write_json,
+    build_agent_prompt,
     make_run_id,
     read_json_object,
     run_lock,
@@ -90,6 +91,8 @@ def semantic_card(
         {"title": "Selection", "content": "Strong evidence.", "collapsed": True},
     ]
     if template == "research_item":
+        title = "Memory-R1: Learning to Manage Agent Memory"
+        subtitle = "Memory-R1：学习管理智能体记忆"
         fields = [
             {"label": "日期", "value": "2026-08-19", "short": True},
             {"label": "状态", "value": "正式发表", "short": True},
@@ -106,9 +109,14 @@ def semantic_card(
         ]
         sections = [
             {
-                "title": "中文摘要",
-                "content": "该研究解决长程任务中记忆写入与检索失配的问题。方法通过结构化经验索引保留可重用信息。跨任务实验显示完成率提升，但证据仍受模型与基准范围限制。",
+                "title": "一句话概述",
+                "content": "该研究解决长程任务中记忆写入与检索失配的问题，并通过强化学习训练智能体判断何时写入、更新和读取记忆。",
                 "collapsed": False,
+            },
+            {
+                "title": "论文摘要翻译",
+                "content": "大型语言模型智能体需要在长期交互中管理不断累积的记忆，但固定规则难以同时适应写入、更新和检索。论文提出一种强化学习方法，把记忆操作作为可学习决策并与任务执行联合优化。作者在受控任务中比较该方法与既有记忆管理策略，同时说明当前验证范围仍受所用模型和环境限制。",
+                "collapsed": True,
             },
             {
                 "title": "现存问题",
@@ -133,12 +141,8 @@ def semantic_card(
         ]
     return {
         "template": template,
-        "title": f"Card {rank}",
-        "subtitle": (
-            "解决长程任务中经验难以稳定复用的问题"
-            if template == "research_item"
-            else "2026-08-19 · verified"
-        ),
+        "title": title if template == "research_item" else f"Card {rank}",
+        "subtitle": subtitle if template == "research_item" else "2026-08-19 · verified",
         "theme": "blue" if template == "research_item" else "green",
         "tag": f"TOP {rank}" if template == "research_item" else "ALERT",
         "focus": {"value": f"#{rank}", "label": "Top research item"},
@@ -214,6 +218,57 @@ class RepositoryContractTests(unittest.TestCase):
         for title in feishu_cards.RESEARCH_SECTION_TITLES:
             self.assertIn(f"`{title}`", prompt)
 
+    def test_structured_output_schema_accepts_the_renderable_research_card(self) -> None:
+        schema = json.loads(
+            (REPO_ROOT / "config" / "task-result.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        sections_limit = schema["properties"]["notification"]["properties"][
+            "cards"
+        ]["items"]["properties"]["sections"]["maxItems"]
+        renderable_sections = len(semantic_card("research_item")["sections"])
+
+        self.assertGreaterEqual(
+            sections_limit,
+            renderable_sections,
+            "Codex output schema must accept every section the renderer accepts",
+        )
+
+    def test_task_c_execution_prompt_requires_unique_historical_backfill(self) -> None:
+        business_prompt = (
+            REPO_ROOT / "tasks" / "agent-memory-frontier" / "TASK.md"
+        ).read_text(encoding="utf-8")
+        prompt = build_agent_prompt(
+            task_id="agent-memory-frontier",
+            task_name="Agent Memory 前沿增量追踪",
+            prompt_path="tasks/agent-memory-frontier/TASK.md",
+            prompt_text=business_prompt,
+            state_path="state/agent-memory-frontier.json",
+            state_context={
+                "reported_items": ["arxiv:2608.20274"],
+                "paper_registry": {
+                    "arxiv:2608.20274": {
+                        "primary_source": "https://arxiv.org/abs/2608.20274"
+                    }
+                },
+            },
+            scheduled_at="2026-08-25T09:00:00+08:00",
+            trigger_slot="09:00",
+            timezone_name="Asia/Shanghai",
+            presentation_instruction="Return five research cards.",
+        )
+
+        self.assertIn('"reported_items": ["arxiv:2608.20274"]', prompt)
+        self.assertIn(
+            "Selection priority is strict: (1) quality and deduplication; "
+            "(2) recency; (3) completing all five slots.",
+            prompt,
+        )
+        self.assertIn("Exclude every item already present in `reported_items`", prompt)
+        self.assertIn("move the publication cutoff backward", prompt)
+        self.assertIn("Do not reuse a previously reported item", prompt)
+
     def test_a_share_prompt_monitors_every_configured_trigger(self) -> None:
         config = load_task_config(REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml")
         prompt = (REPO_ROOT / "tasks" / "a-share-monitor" / "TASK.md").read_text(
@@ -288,15 +343,6 @@ class RepositoryContractTests(unittest.TestCase):
             REPO_ROOT / "tasks" / "agent-memory-frontier" / "task.yaml"
         )
         self.assertEqual(2 * 60 * 60, config["execution"]["timeout_seconds"])
-
-    def test_task_b_always_reports_daily_status(self) -> None:
-        config = load_task_config(REPO_ROOT / "tasks" / "apple-price-monitor" / "task.yaml")
-        prompt = (REPO_ROOT / "tasks" / "apple-price-monitor" / "TASK.md").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual("always", config["delivery"]["policy"])
-        self.assertIn("每次成功执行都必须返回 `SUCCESS_NOTIFY`", prompt)
-        self.assertIn("不得因“首次建立基线”", prompt)
 
     def test_scheduler_has_exact_daily_slots_and_ignores_disabled_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -543,6 +589,136 @@ class TaskBehaviorRegressionTests(unittest.TestCase):
                         iter(state["_runtime"]["notifications"].values())
                     )
                     self.assertNotIn("daily_archive", notification)
+
+    def test_task_c_successful_daily_run_retries_silence_and_sends_five_cards(self) -> None:
+        config = load_task_config(
+            REPO_ROOT / "tasks" / "agent-memory-frontier" / "task.yaml"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            prompt_path = repo / "tasks" / "agent-memory-frontier" / "TASK.md"
+            prompt_path.parent.mkdir(parents=True)
+            shutil.copy2(
+                REPO_ROOT / "tasks" / "agent-memory-frontier" / "TASK.md",
+                prompt_path,
+            )
+            state_path = repo / "state" / "agent-memory-frontier.json"
+            atomic_write_json(
+                state_path,
+                {
+                    "schema_version": 1,
+                    "task_id": "agent-memory-frontier",
+                    "state_version": 0,
+                    "_runtime": {"processed_runs": {}, "notifications": {}},
+                },
+            )
+            attempts = []
+            deliveries = []
+
+            def agent(
+                prompt: str, task_config: Dict[str, Any], root: Path
+            ) -> Dict[str, Any]:
+                attempts.append(prompt)
+                if len(attempts) == 1:
+                    return structured_result(SUCCESS_NO_NOTIFY)
+                return structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="agent-memory:2026-08-24:daily-top5",
+                    cards=[
+                        semantic_card("research_item", rank=rank)
+                        for rank in range(1, 6)
+                    ],
+                )
+
+            result = execute_production_task(
+                repo_root=repo,
+                config=config,
+                prompt_path=prompt_path,
+                state_path=state_path,
+                output_directory=repo / "outputs" / "agent-memory-frontier",
+                scheduled_at=datetime(
+                    2026, 8, 24, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+                ),
+                trigger_slot="09:00",
+                agent_runner=agent,
+                delivery_sender=lambda text, **kwargs: (
+                    deliveries.append(kwargs)
+                    or {
+                        "status": "ok",
+                        "message_id": f"om_research_{len(deliveries)}",
+                    }
+                ),
+            )
+
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(2, len(attempts))
+        self.assertEqual(5, len(deliveries))
+        self.assertTrue(result["notification_sent"])
+
+    def test_task_b_disabled_task_is_not_due(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            (repo / "scripts").mkdir()
+            shutil.copy2(REPO_ROOT / "scripts" / "smoke_test.py", repo / "scripts")
+
+            due = due_runs(
+                repo,
+                datetime(
+                    2026, 8, 24, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+                ),
+            )
+
+        self.assertNotIn("apple-price-monitor", {item["task"] for item in due})
+
+    def test_task_b_delivery_is_disabled_even_when_manually_executed(self) -> None:
+        config = load_task_config(
+            REPO_ROOT / "tasks" / "apple-price-monitor" / "task.yaml"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            prompt_path = repo / "tasks" / "apple-price-monitor" / "TASK.md"
+            prompt_path.parent.mkdir(parents=True)
+            shutil.copy2(
+                REPO_ROOT / "tasks" / "apple-price-monitor" / "TASK.md",
+                prompt_path,
+            )
+            state_path = repo / "state" / "apple-price-monitor.json"
+            atomic_write_json(
+                state_path,
+                {
+                    "schema_version": 1,
+                    "task_id": "apple-price-monitor",
+                    "state_version": 0,
+                    "_runtime": {"processed_runs": {}, "notifications": {}},
+                },
+            )
+            deliveries = []
+
+            result = execute_production_task(
+                repo_root=repo,
+                config=config,
+                prompt_path=prompt_path,
+                state_path=state_path,
+                output_directory=repo / "outputs" / "apple-price-monitor",
+                scheduled_at=datetime(
+                    2026, 8, 24, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+                ),
+                trigger_slot="10:00",
+                agent_runner=lambda prompt, task_config, root: structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="apple-price:manual-check",
+                    cards=[semantic_card("price_alert")],
+                ),
+                delivery_sender=lambda text, **kwargs: (
+                    deliveries.append(kwargs)
+                    or {"status": "ok", "message_id": "om_must_not_send"}
+                ),
+            )
+
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual("skipped", result["delivery_status"])
+        self.assertEqual([], deliveries)
 
 
 class ProductionRuntimeTests(unittest.TestCase):
@@ -1285,6 +1461,38 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertIn("delivery.policy=always", attempts[1])
         self.assertEqual(1, len(deliveries))
 
+    def test_always_policy_delivers_same_event_on_each_scheduled_run(self) -> None:
+        self.config["delivery"]["policy"] = "always"
+        self.config["delivery"]["presentation"] = "price_alert_cards"
+        deliveries = []
+        payload = structured_result(
+            SUCCESS_NOTIFY,
+            event_key="daily-briefing:same-ranked-items",
+            cards=[semantic_card("price_alert")],
+        )
+
+        first = self.execute(
+            payload,
+            sender=lambda text, **kwargs: (
+                deliveries.append(kwargs)
+                or {"status": "ok", "message_id": "om_day_1"}
+            ),
+        )
+        second = self.execute(
+            payload,
+            sender=lambda text, **kwargs: (
+                deliveries.append(kwargs)
+                or {"status": "ok", "message_id": "om_day_2"}
+            ),
+            scheduled_at=self.scheduled_at.replace(day=20),
+        )
+
+        self.assertEqual(SUCCESS_NOTIFY, first["status"])
+        self.assertEqual(SUCCESS_NOTIFY, second["status"])
+        self.assertTrue(first["notification_sent"])
+        self.assertTrue(second["notification_sent"])
+        self.assertEqual(2, len(deliveries))
+
     def test_partial_five_card_delivery_recovers_remaining_cards_only(self) -> None:
         self.config["delivery"]["presentation"] = "research_top5_cards"
         cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
@@ -1358,15 +1566,33 @@ class ProductionRuntimeTests(unittest.TestCase):
 
 
 class CardRenderingTests(unittest.TestCase):
-    def test_research_cards_require_chinese_summary_and_ordered_details(self) -> None:
+    def test_research_cards_show_overview_before_collapsed_abstract_and_details(self) -> None:
         cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
+        try:
+            cards = feishu_cards.validate_card_specs(cards)
+        except feishu_cards.CardSpecError as exc:
+            self.fail(f"new research card contract was rejected: {exc}")
         feishu_cards.validate_presentation(
             "research_top5_cards", cards, should_notify=True
         )
 
-        cards[0]["sections"][0]["content"] = "English abstract only."
+        rendered = feishu_cards.render_card(cards[0])
+        self.assertEqual(
+            "Memory-R1: Learning to Manage Agent Memory",
+            rendered["header"]["title"]["content"],
+        )
+        self.assertEqual(
+            "Memory-R1：学习管理智能体记忆",
+            rendered["header"]["subtitle"]["content"],
+        )
+        self.assertIn("一句话概述", rendered["body"]["elements"][0]["content"])
+        panel = rendered["body"]["elements"][2]
+        self.assertEqual(5, len(panel["elements"]))
+        self.assertIn("论文摘要翻译", panel["elements"][0]["content"])
+
+        cards[0]["sections"][1]["content"] = "English abstract only."
         with self.assertRaisesRegex(
-            feishu_cards.CardSpecError, "substantive Chinese summary"
+            feishu_cards.CardSpecError, "substantive Chinese abstract translation"
         ):
             feishu_cards.validate_presentation(
                 "research_top5_cards", cards, should_notify=True
@@ -1384,11 +1610,24 @@ class CardRenderingTests(unittest.TestCase):
                 "research_top5_cards", cards, should_notify=True
             )
 
+    def test_research_overview_rejects_experimental_numbers(self) -> None:
+        cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
+        cards[0]["sections"][0]["content"] = (
+            "该研究解决记忆检索失配问题，并把任务成功率提升到百分之八十。"
+        )
+
+        with self.assertRaisesRegex(
+            feishu_cards.CardSpecError, "must omit experimental data"
+        ):
+            feishu_cards.validate_presentation(
+                "research_top5_cards", cards, should_notify=True
+            )
+
     def test_research_cards_require_visible_summary_and_research_metadata(self) -> None:
         cards = [semantic_card("research_item", rank=index) for index in range(1, 6)]
         cards[0]["sections"][0]["collapsed"] = True
         with self.assertRaisesRegex(
-            feishu_cards.CardSpecError, "one visible Chinese summary"
+            feishu_cards.CardSpecError, "one visible overview"
         ):
             feishu_cards.validate_presentation(
                 "research_top5_cards", cards, should_notify=True
@@ -1420,8 +1659,8 @@ class CardRenderingTests(unittest.TestCase):
         self.assertEqual(
             "论文详解（点击展开/收起）", panel["header"]["title"]["content"]
         )
-        self.assertIn("中文摘要", card["body"]["elements"][0]["content"])
-        self.assertEqual(4, len(panel["elements"]))
+        self.assertIn("一句话概述", card["body"]["elements"][0]["content"])
+        self.assertEqual(5, len(panel["elements"]))
         for element, title in zip(
             panel["elements"], feishu_cards.RESEARCH_SECTION_TITLES[1:]
         ):

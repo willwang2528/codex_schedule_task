@@ -854,7 +854,14 @@ def execute_production_task(
 
             if result["should_notify"]:
                 event_key = str(result["notification"]["event_key"])
-                fingerprint = notification_fingerprint(task_id, event_key)
+                fingerprint_event_key = (
+                    f"{event_key}|run:{run_id}"
+                    if delivery_config.get("policy") == "always"
+                    else event_key
+                )
+                fingerprint = notification_fingerprint(
+                    task_id, fingerprint_event_key
+                )
                 existing_notification = notifications.get(fingerprint)
                 if isinstance(existing_notification, dict) and existing_notification.get("status") == "sent":
                     status = SUCCESS_NO_NOTIFY

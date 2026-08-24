@@ -75,7 +75,7 @@ FEISHU_CHAT_ID_SCHEDULE_TASK
 
 需要“所有时点采集、仅部分时点通知”时，在 `delivery.notification_triggers` 设置通知白名单。Task A 固定为 `["09:35", "11:20", "15:01"]`；其他时点仍生成输出和状态，但 Harness 不创建或恢复飞书通知。
 
-正式通知使用 Feishu Card 2.0：Agent Memory 固定五张研究卡，每张默认展示中文摘要，展开后按“现存问题—已有方法的不足—当前方法为什么可行—未来展望”快速浏览；A 股正常交易日使用“盘面总览—情绪与主线—异动与风险”三张渐进式市场卡，Apple 使用逐 SKU 价格卡。Agent Memory 卡片调研与取舍见 [论文速览卡片调研](docs/AGENT_MEMORY_PAPER_CARD_REVIEW.md)，A 股竞品调研与取舍见 [A 股分析产品复盘调研](docs/A_SHARE_COMPETITIVE_REVIEW.md)，实现与降级策略见 [飞书卡片投递](docs/FEISHU_CARDS.md)。
+正式通知使用 Feishu Card 2.0：Agent Memory 每日成功运行固定发送五张研究卡，选文先保证高质量与跨日去重，再优先近期，近期不足时按发布时间向历史回溯补满；每张首屏展示英文原题、中文译名和仅说明问题与方法的一句话概述，展开后先读论文摘要翻译，再按“现存问题—已有方法的不足—当前方法为什么可行—未来展望”深入浏览。A 股正常交易日使用“盘面总览—情绪与主线—异动与风险”三张渐进式市场卡。Apple 价格任务当前已停用且不会投递群消息。Agent Memory 卡片调研与取舍见 [论文速览卡片调研](docs/AGENT_MEMORY_PAPER_CARD_REVIEW.md)，A 股竞品调研与取舍见 [A 股分析产品复盘调研](docs/A_SHARE_COMPETITIVE_REVIEW.md)，实现与降级策略见 [飞书卡片投递](docs/FEISHU_CARDS.md)。
 
 新增功能和修复必须遵循 RED—GREEN—REFACTOR，并通过真实任务配置行为矩阵、Runner 临时状态集成测试和完整本地质量门禁，详见 [测试策略](docs/TEST_STRATEGY.md)。
 

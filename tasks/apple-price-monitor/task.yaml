@@ -1,6 +1,6 @@
 id: apple-price-monitor
 name: 苹果产品优惠监控
-enabled: true
+enabled: false
 
 schedule:
   timezone: Asia/Shanghai
@@ -21,10 +21,10 @@ execution:
   retry_backoff_seconds: 30
 
 delivery:
-  type: feishu
-  enabled: true
+  type: none
+  enabled: false
   target: configured_chat
-  policy: always
+  policy: never
   presentation: price_alert_cards
   retry_attempts: 2
 
