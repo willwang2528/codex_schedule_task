@@ -7,7 +7,7 @@
     "should_notify",
     "summary",
     "output_markdown",
-    "state_updates_json",
+    "state_updates",
     "notification",
     "skip_reason",
     "error",
@@ -32,8 +32,46 @@
     "output_markdown": {
       "type": "string"
     },
-    "state_updates_json": {
-      "type": "string"
+    "state_updates": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["namespace", "operation", "value_json"],
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "enum": [
+              "intraday_state",
+              "completed_trigger_slots_add",
+              "trading_date",
+              "alert_fingerprints",
+              "archived_trading_days",
+              "cooldown",
+              "last_notified_at",
+              "last_seen_at",
+              "paper_registry",
+              "paper_status",
+              "paper_versions",
+              "reported_items",
+              "content_fingerprint",
+              "alert_history",
+              "baseline_price",
+              "historical_low",
+              "last_alerted_price",
+              "last_valid_price",
+              "price_history",
+              "products"
+            ]
+          },
+          "operation": {
+            "type": "string",
+            "enum": ["upsert"]
+          },
+          "value_json": {"type": "string"}
+        }
+      }
     },
     "notification": {
       "type": "object",

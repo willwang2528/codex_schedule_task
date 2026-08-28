@@ -36,6 +36,7 @@ state:
   enabled: true
   path: state/apple-price-monitor.json
   context_recent_items: 30
+  allowed_update_keys: ["baseline_price", "historical_low", "last_valid_price", "price_history", "products"]
 
 logging:
   directory: logs/apple-price-monitor

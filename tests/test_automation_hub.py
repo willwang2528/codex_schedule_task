@@ -42,6 +42,14 @@ from task_runtime import (
 from validate_task import load_task_config, validate_all_tasks, validate_task_config
 
 
+def copy_result_schema(repo: Path) -> None:
+    (repo / "config").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        REPO_ROOT / "config" / "task-result.schema.json",
+        repo / "config" / "task-result.schema.json",
+    )
+
+
 def structured_result(
     status: str,
     *,
@@ -51,12 +59,20 @@ def structured_result(
     cards: list[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     should_notify = status == SUCCESS_NOTIFY
+    state_updates = [
+        {
+            "namespace": str(namespace),
+            "operation": "upsert",
+            "value_json": json.dumps(value, ensure_ascii=False, sort_keys=True),
+        }
+        for namespace, value in (updates or {}).items()
+    ]
     return {
         "status": status,
         "should_notify": should_notify,
         "summary": "completed" if status in {SUCCESS_NOTIFY, SUCCESS_NO_NOTIFY} else "",
         "output_markdown": f"# {status}",
-        "state_updates_json": json.dumps(updates or {}, ensure_ascii=False),
+        "state_updates": state_updates,
         "notification": {
             "title": "Important update" if should_notify else "",
             "body": "Stable business event" if should_notify else "",
@@ -73,6 +89,24 @@ def structured_result(
             }
         ],
     }
+
+
+def structured_result_v2(
+    status: str,
+    *,
+    updates: Dict[str, Any] | None = None,
+    event_key: str = "",
+    error: str = "",
+    cards: list[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    value = structured_result(
+        status,
+        updates=updates,
+        event_key=event_key,
+        error=error,
+        cards=cards,
+    )
+    return value
 
 
 def semantic_card(
@@ -235,6 +269,57 @@ class RepositoryContractTests(unittest.TestCase):
             "Codex output schema must accept every section the renderer accepts",
         )
 
+    def test_structured_output_schema_rejects_unknown_state_namespaces(self) -> None:
+        schema = json.loads(
+            (REPO_ROOT / "config" / "task-result.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertIn("state_updates", schema["required"])
+        self.assertNotIn("state_updates_json", schema["properties"])
+        state_updates = schema["properties"]["state_updates"]
+        self.assertEqual("array", state_updates["type"])
+        operation = state_updates["items"]
+        self.assertEqual(False, operation["additionalProperties"])
+        self.assertEqual(
+            set(operation["properties"]),
+            set(operation["required"]),
+        )
+        self.assertNotIn(
+            "last_run_at",
+            operation["properties"]["namespace"]["enum"],
+        )
+
+    def test_structured_output_schema_is_compatible_with_strict_mode(self) -> None:
+        schema = json.loads(
+            (REPO_ROOT / "config" / "task-result.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        def assert_strict_object(node: Any, path: str = "") -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    properties = node.get("properties", {})
+                    self.assertEqual(
+                        False,
+                        node.get("additionalProperties"),
+                        f"{path or '/'} must reject additional properties",
+                    )
+                    self.assertEqual(
+                        set(properties),
+                        set(node.get("required", [])),
+                        f"{path or '/'} must require every property",
+                    )
+                for key, child in node.items():
+                    assert_strict_object(child, f"{path}/{key}")
+            elif isinstance(node, list):
+                for index, child in enumerate(node):
+                    assert_strict_object(child, f"{path}/{index}")
+
+        assert_strict_object(schema)
+
     def test_task_c_execution_prompt_requires_unique_historical_backfill(self) -> None:
         business_prompt = (
             REPO_ROOT / "tasks" / "agent-memory-frontier" / "TASK.md"
@@ -290,6 +375,47 @@ class RepositoryContractTests(unittest.TestCase):
                 self.assertIn(f"`{title}`", prompt)
         self.assertIn("SUCCESS_NOTIFY", prompt)
         self.assertIn("Deterministic workflow evidence", prompt)
+        self.assertEqual(
+            config["schedule"]["triggers"],
+            config["delivery"]["failure_alert"]["trigger_slots"],
+        )
+        self.assertTrue(config["delivery"]["failure_alert"]["enabled"])
+        self.assertEqual(
+            ["11:20", "15:01"],
+            config["delivery"].get("completion_monitor", {}).get("trigger_slots"),
+        )
+        self.assertTrue(config["delivery"].get("readback", {}).get("enabled"))
+        self.assertEqual(
+            ["intraday_state", "completed_trigger_slots_add", "trading_date"],
+            config["state"].get("allowed_update_keys"),
+        )
+
+    def test_failure_alert_trigger_slots_must_be_scheduled(self) -> None:
+        config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
+        config = load_task_config(config_path)
+        config["delivery"]["failure_alert"] = {
+            "enabled": True,
+            "trigger_slots": ["12:34"],
+        }
+
+        errors = validate_task_config(config, config_path, REPO_ROOT)
+
+        self.assertIn(
+            "delivery.failure_alert.trigger_slots must be a subset of schedule.triggers: 12:34",
+            errors,
+        )
+
+    def test_task_state_namespaces_must_exist_in_result_schema(self) -> None:
+        config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
+        config = load_task_config(config_path)
+        config["state"]["allowed_update_keys"].append("invented_namespace")
+
+        errors = validate_task_config(config, config_path, REPO_ROOT)
+
+        self.assertIn(
+            "state.allowed_update_keys must be declared in task-result schema: invented_namespace",
+            errors,
+        )
 
     def test_daily_archive_triggers_must_be_notification_enabled(self) -> None:
         config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
@@ -348,6 +474,7 @@ class RepositoryContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             isolated_root = Path(directory).resolve()
             shutil.copytree(REPO_ROOT / "tasks", isolated_root / "tasks")
+            copy_result_schema(isolated_root)
             (isolated_root / "scripts").mkdir()
             shutil.copy2(
                 REPO_ROOT / "scripts" / "smoke_test.py",
@@ -407,6 +534,7 @@ class SchedulerRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory).resolve()
             shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            copy_result_schema(repo)
             scripts = repo / "scripts"
             scripts.mkdir()
             shutil.copy2(REPO_ROOT / "scripts" / "smoke_test.py", scripts)
@@ -422,6 +550,13 @@ class SchedulerRegressionTests(unittest.TestCase):
                 {
                     "_runtime": {
                         "processed_runs": {},
+                        "health_checks": {
+                            make_run_id(
+                                "a-share-monitor",
+                                "2026-08-19T11:20:00+08:00",
+                                "11:20",
+                            ): {"status": "healthy"}
+                        },
                         "notifications": {
                             "pending-market": {
                                 "status": "pending",
@@ -480,6 +615,63 @@ class SchedulerRegressionTests(unittest.TestCase):
             ],
         )
 
+    def test_missing_notification_run_after_grace_creates_alert_and_health_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            task_root = repo / "tasks" / "a-share-monitor"
+            task_root.parent.mkdir(parents=True)
+            shutil.copytree(REPO_ROOT / "tasks" / "a-share-monitor", task_root)
+            copy_result_schema(repo)
+            (repo / "scripts").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "scripts" / "smoke_test.py",
+                repo / "scripts" / "smoke_test.py",
+            )
+            atomic_write_json(
+                repo / "state" / "a-share-monitor.json",
+                {"_runtime": {"processed_runs": {}, "notifications": {}}},
+            )
+            at = datetime(
+                2026, 8, 28, 11, 31, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+
+            with patch.object(
+                production_runner,
+                "send_message",
+                return_value={"status": "ok", "message_id": "om_missing_run"},
+            ), patch.object(
+                production_runner,
+                "read_message",
+                return_value={
+                    "status": "ok",
+                    "message_id": "om_missing_run",
+                    "chat_id": "oc_market",
+                    "msg_type": "post",
+                },
+                create=True,
+            ):
+                result = scheduler.run_once(
+                    repo,
+                    at=at,
+                    dry_run=False,
+                    recover_pending=True,
+                )
+
+            state = read_json_object(repo / "state" / "a-share-monitor.json")
+            alerts = [
+                value
+                for value in state["_runtime"]["notifications"].values()
+                if value.get("purpose") == "failure_alert"
+            ]
+            health_log = repo / "logs" / "scheduler" / "health.jsonl"
+            health_log_exists = health_log.is_file()
+
+        self.assertEqual(1, len(result.get("monitoring", [])))
+        self.assertEqual("missing_run", result["monitoring"][0]["reason"])
+        self.assertEqual(1, len(alerts))
+        self.assertEqual("sent", alerts[0]["status"])
+        self.assertTrue(health_log_exists)
+
 
 class TaskBehaviorRegressionTests(unittest.TestCase):
     def test_task_a_real_config_enforces_collection_send_and_archive_matrix(self) -> None:
@@ -533,7 +725,11 @@ class TaskBehaviorRegressionTests(unittest.TestCase):
                     if expected_status == SUCCESS_NOTIFY
                     else structured_result(
                         SUCCESS_NO_NOTIFY,
-                        updates={"last_collected_slot": slot},
+                        updates={
+                            "intraday_state": {
+                                f"2026-08-19|{slot}": {"collector": "verified"}
+                            }
+                        },
                     )
                 )
 
@@ -541,6 +737,15 @@ class TaskBehaviorRegressionTests(unittest.TestCase):
                     production_runner,
                     "_load_workflow_evidence",
                     return_value={"status": "ok", "collector": "fixture"},
+                ), patch.object(
+                    production_runner,
+                    "read_message",
+                    side_effect=lambda message_id, **kwargs: {
+                        "status": "ok",
+                        "message_id": message_id,
+                        "chat_id": "oc_market",
+                        "msg_type": "interactive",
+                    },
                 ):
                     result = execute_production_task(
                         repo_root=repo,
@@ -571,7 +776,10 @@ class TaskBehaviorRegressionTests(unittest.TestCase):
                 self.assertEqual(1, state["state_version"])
                 self.assertTrue((repo / result["output_json"]).is_file())
                 if slot == "09:20":
-                    self.assertEqual("09:20", state["last_collected_slot"])
+                    self.assertEqual(
+                        "verified",
+                        state["intraday_state"]["2026-08-19|09:20"]["collector"],
+                    )
                     self.assertEqual({}, state["_runtime"]["notifications"])
                 elif slot == "15:01":
                     notification = next(
@@ -659,6 +867,7 @@ class TaskBehaviorRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory).resolve()
             shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            copy_result_schema(repo)
             (repo / "scripts").mkdir()
             shutil.copy2(REPO_ROOT / "scripts" / "smoke_test.py", repo / "scripts")
 
@@ -875,7 +1084,363 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertEqual(0, state["state_version"])
         self.assertNotIn("last_run_at", state)
 
-    def test_agent_cannot_overwrite_harness_owned_runtime_state(self) -> None:
+    def test_reserved_state_property_gets_machine_readable_retry_then_safe_downgrade(self) -> None:
+        self.config["delivery"].update(
+            {
+                "presentation": "market_dashboard_card",
+                "notification_triggers": ["09:20"],
+            }
+        )
+        self.config["state"]["allowed_update_keys"] = ["intraday_state"]
+        prompts = []
+        deliveries = []
+
+        def agent(prompt: str, config: Dict[str, Any], root: Path) -> Dict[str, Any]:
+            prompts.append(prompt)
+            return structured_result_v2(
+                SUCCESS_NOTIFY,
+                updates={
+                    "intraday_state": {"2026-08-19|09:20": {"breadth": "verified"}},
+                    "last_run_at": "agent-controlled-value",
+                },
+                event_key="market:2026-08-19:09:20",
+                cards=market_dashboard_cards(),
+            )
+
+        result = execute_production_task(
+            repo_root=self.repo,
+            config=self.config,
+            prompt_path=self.prompt_path,
+            state_path=self.state_path,
+            output_directory=self.output_directory,
+            scheduled_at=self.scheduled_at,
+            trigger_slot="09:20",
+            agent_runner=agent,
+            delivery_sender=lambda text, **kwargs: (
+                deliveries.append(kwargs)
+                or {"status": "ok", "message_id": f"om_{len(deliveries)}"}
+            ),
+        )
+
+        state = read_json_object(self.state_path)
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(2, len(prompts))
+        self.assertIn('"path": "/state_updates/1/namespace"', prompts[1])
+        self.assertIn('"rule": "forbidden_property"', prompts[1])
+        self.assertEqual(
+            "verified",
+            state["intraday_state"]["2026-08-19|09:20"]["breadth"],
+        )
+        self.assertNotEqual("agent-controlled-value", state["last_run_at"])
+        self.assertEqual(3, len(deliveries))
+        self.assertEqual(
+            "/state_updates/1/namespace",
+            result["validation_warnings"][0]["path"],
+        )
+
+    def test_unknown_state_property_is_not_safely_downgraded(self) -> None:
+        self.config["state"]["allowed_update_keys"] = ["intraday_state"]
+        prompts = []
+
+        def agent(prompt: str, config: Dict[str, Any], root: Path) -> Dict[str, Any]:
+            prompts.append(prompt)
+            return structured_result_v2(
+                SUCCESS_NO_NOTIFY,
+                updates={"intraday_state": {}, "invented_namespace": 1},
+            )
+
+        result = execute_production_task(
+            repo_root=self.repo,
+            config=self.config,
+            prompt_path=self.prompt_path,
+            state_path=self.state_path,
+            output_directory=self.output_directory,
+            scheduled_at=self.scheduled_at,
+            trigger_slot="09:20",
+            agent_runner=agent,
+        )
+
+        state = read_json_object(self.state_path)
+        self.assertEqual(FAILED, result["status"])
+        self.assertEqual(2, len(prompts))
+        self.assertIn(
+            '"path": "/state_updates/1/namespace"', prompts[1]
+        )
+        self.assertNotIn("invented_namespace", state)
+        self.assertEqual(0, state["state_version"])
+
+    def test_invalid_state_value_json_gets_exact_correction_path(self) -> None:
+        self.config["state"]["allowed_update_keys"] = ["intraday_state"]
+        prompts = []
+
+        def agent(prompt: str, config: Dict[str, Any], root: Path) -> Dict[str, Any]:
+            prompts.append(prompt)
+            result = structured_result(
+                SUCCESS_NO_NOTIFY,
+                updates={"intraday_state": {"slot": {"breadth": "verified"}}},
+            )
+            if len(prompts) == 1:
+                result["state_updates"][0]["value_json"] = "{"
+            return result
+
+        result = execute_production_task(
+            repo_root=self.repo,
+            config=self.config,
+            prompt_path=self.prompt_path,
+            state_path=self.state_path,
+            output_directory=self.output_directory,
+            scheduled_at=self.scheduled_at,
+            trigger_slot="09:20",
+            agent_runner=agent,
+        )
+
+        state = read_json_object(self.state_path)
+        self.assertEqual(SUCCESS_NO_NOTIFY, result["status"])
+        self.assertEqual(2, len(prompts))
+        self.assertIn('"path": "/state_updates/0/value_json"', prompts[1])
+        self.assertIn('"rule": "invalid_json"', prompts[1])
+        self.assertEqual("verified", state["intraday_state"]["slot"]["breadth"])
+
+    def test_delivery_is_sent_only_after_message_id_readback(self) -> None:
+        self.config["delivery"]["readback"] = {
+            "enabled": True,
+            "trigger_slots": ["09:20"],
+            "retry_attempts": 1,
+        }
+        reads = []
+        with patch.object(
+            production_runner,
+            "read_message",
+            side_effect=lambda message_id, **kwargs: (
+                reads.append((message_id, kwargs))
+                or {
+                    "status": "ok",
+                    "message_id": message_id,
+                    "chat_id": "oc_market",
+                    "msg_type": "post",
+                }
+            ),
+            create=True,
+        ):
+            result = self.execute(
+                structured_result_v2(
+                    SUCCESS_NOTIFY,
+                    event_key="market-readback:2026-08-19:09:20",
+                ),
+                sender=lambda text, **kwargs: {
+                    "status": "ok",
+                    "message_id": "om_verified",
+                },
+            )
+
+        state = read_json_object(self.state_path)
+        notifications = list(state["_runtime"]["notifications"].values())
+        self.assertTrue(notifications, "delivery must create a pending notification")
+        notification = notifications[0]
+        message = notification["messages"][0]
+        self.assertEqual(SUCCESS_NOTIFY, result["status"])
+        self.assertEqual(["om_verified"], [value[0] for value in reads])
+        self.assertEqual("verified", message["readback_status"])
+        self.assertEqual("sent", message["status"])
+
+    def test_readback_failure_keeps_pending_and_recovery_does_not_resend(self) -> None:
+        self.config["delivery"]["readback"] = {
+            "enabled": True,
+            "trigger_slots": ["09:20"],
+            "retry_attempts": 1,
+        }
+        sends = []
+        with patch.object(
+            production_runner,
+            "read_message",
+            side_effect=FeishuDeliveryError("message not visible yet"),
+            create=True,
+        ):
+            first = self.execute(
+                structured_result_v2(
+                    SUCCESS_NOTIFY,
+                    event_key="market-readback-pending:2026-08-19:09:20",
+                ),
+                sender=lambda text, **kwargs: (
+                    sends.append(kwargs)
+                    or {"status": "ok", "message_id": "om_pending_readback"}
+                ),
+            )
+
+        state = read_json_object(self.state_path)
+        notifications = list(state["_runtime"]["notifications"].values())
+        self.assertTrue(notifications, "delivery must create a pending notification")
+        notification = notifications[0]
+        self.assertEqual(FAILED, first["status"])
+        self.assertEqual("pending", notification["status"])
+        self.assertEqual("om_pending_readback", notification["messages"][0]["message_id"])
+
+        with patch.object(
+            production_runner,
+            "read_message",
+            return_value={
+                "status": "ok",
+                "message_id": "om_pending_readback",
+                "chat_id": "oc_market",
+                "msg_type": "post",
+            },
+            create=True,
+        ):
+            recovery = recover_pending_delivery(
+                config=self.config,
+                state_path=self.state_path,
+                delivery_sender=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("accepted message must not be sent twice")
+                ),
+            )
+
+        updated = read_json_object(self.state_path)
+        recovered_notification = next(
+            iter(updated["_runtime"]["notifications"].values())
+        )
+        self.assertEqual(SUCCESS_NO_NOTIFY, recovery["status"])
+        self.assertEqual(1, recovery["recovered"])
+        self.assertEqual(1, len(sends))
+        self.assertEqual("sent", recovered_notification["status"])
+
+
+    def test_failed_data_only_run_sends_one_deterministic_failure_alert(self) -> None:
+        self.config["schedule"]["triggers"] = ["09:20", "11:20"]
+        self.config["delivery"]["notification_triggers"] = ["11:20"]
+        self.config["delivery"]["chat_id_env"] = (
+            "FEISHU_CHAT_ID_TEST_TASK_SCHEDULE_TASK"
+        )
+        self.config["delivery"]["failure_alert"] = {
+            "enabled": True,
+            "trigger_slots": ["09:20", "11:20"],
+        }
+        deliveries = []
+
+        def sender(text: str, **kwargs: Any) -> Dict[str, Any]:
+            deliveries.append({"text": text, **kwargs})
+            return {"status": "ok", "message_id": "om_failure_alert"}
+
+        result = self.execute(
+            structured_result(FAILED, error="market collector timed out"),
+            sender=sender,
+            trigger_slot="09:20",
+        )
+
+        state = read_json_object(self.state_path)
+        alerts = [
+            value
+            for value in state["_runtime"]["notifications"].values()
+            if value.get("purpose") == "failure_alert"
+        ]
+        self.assertEqual(FAILED, result["status"])
+        self.assertEqual("sent", result["failure_alert_status"])
+        self.assertEqual(1, len(deliveries))
+        self.assertEqual("post", deliveries[0]["message_type"])
+        self.assertEqual(
+            "FEISHU_CHAT_ID_TEST_TASK_SCHEDULE_TASK",
+            deliveries[0]["chat_id_env"],
+        )
+        self.assertIn("09:20", deliveries[0]["title"])
+        self.assertIn("market collector timed out", deliveries[0]["text"])
+        self.assertIn(result["run_id"], deliveries[0]["text"])
+        self.assertEqual(1, len(alerts))
+        self.assertEqual("sent", alerts[0]["status"])
+        health_records = [
+            json.loads(line)
+            for line in (self.repo / "logs" / "scheduler" / "health.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual("run_failed", health_records[-1]["reason"])
+        self.assertEqual(result["run_id"], health_records[-1]["run_id"])
+        self.assertEqual("sent", health_records[-1]["alert_status"])
+
+    def test_main_delivery_failure_sends_failure_alert_and_keeps_main_pending(self) -> None:
+        self.config["delivery"]["failure_alert"] = {
+            "enabled": True,
+            "trigger_slots": ["09:20"],
+        }
+        deliveries = []
+
+        def sender(text: str, **kwargs: Any) -> Dict[str, Any]:
+            deliveries.append({"text": text, **kwargs})
+            if kwargs.get("title") == "Important update":
+                raise FeishuDeliveryError("market card delivery unavailable")
+            return {"status": "ok", "message_id": "om_delivery_failure_alert"}
+
+        with patch.object(production_runner.time, "sleep", return_value=None):
+            result = self.execute(
+                structured_result(
+                    SUCCESS_NOTIFY,
+                    event_key="market:2026-08-19:09:20",
+                ),
+                sender=sender,
+            )
+
+        state = read_json_object(self.state_path)
+        notifications = list(state["_runtime"]["notifications"].values())
+        normal = [value for value in notifications if not value.get("purpose")]
+        alerts = [
+            value
+            for value in notifications
+            if value.get("purpose") == "failure_alert"
+        ]
+        self.assertEqual(FAILED, result["status"])
+        self.assertEqual("failed", result["delivery_status"])
+        self.assertEqual("sent", result["failure_alert_status"])
+        self.assertEqual("pending", normal[0]["status"])
+        self.assertEqual("sent", alerts[0]["status"])
+        self.assertIn("market card delivery unavailable", alerts[0]["body"])
+
+    def test_failed_failure_alert_stays_pending_and_recovers_once(self) -> None:
+        self.config["delivery"]["notification_triggers"] = ["11:20"]
+        self.config["delivery"]["failure_alert"] = {
+            "enabled": True,
+            "trigger_slots": ["09:20"],
+        }
+
+        def failing_sender(text: str, **kwargs: Any) -> Dict[str, Any]:
+            raise FeishuDeliveryError("alert channel temporarily unavailable")
+
+        with patch.object(production_runner.time, "sleep", return_value=None):
+            result = self.execute(
+                structured_result(FAILED, error="sampling failed"),
+                sender=failing_sender,
+            )
+
+        state = read_json_object(self.state_path)
+        alerts = [
+            value
+            for value in state["_runtime"]["notifications"].values()
+            if value.get("purpose") == "failure_alert"
+        ]
+        self.assertEqual(FAILED, result["status"])
+        self.assertEqual("pending", result["failure_alert_status"])
+        self.assertEqual(1, len(alerts))
+        self.assertEqual("pending", alerts[0]["status"])
+
+        recovered = []
+        recovery = recover_pending_delivery(
+            config=self.config,
+            state_path=self.state_path,
+            delivery_sender=lambda text, **kwargs: (
+                recovered.append(kwargs["idempotency_key"])
+                or {"status": "ok", "message_id": "om_recovered_alert"}
+            ),
+        )
+
+        updated = read_json_object(self.state_path)
+        updated_alerts = [
+            value
+            for value in updated["_runtime"]["notifications"].values()
+            if value.get("purpose") == "failure_alert"
+        ]
+        self.assertEqual(SUCCESS_NO_NOTIFY, recovery["status"])
+        self.assertEqual(1, recovery["recovered"])
+        self.assertEqual(1, len(recovered))
+        self.assertEqual("sent", updated_alerts[0]["status"])
+
+    def test_harness_removes_reserved_runtime_update_after_retry(self) -> None:
         result = self.execute(
             structured_result(
                 SUCCESS_NO_NOTIFY,
@@ -884,9 +1449,10 @@ class ProductionRuntimeTests(unittest.TestCase):
         )
 
         state = read_json_object(self.state_path)
-        self.assertEqual(FAILED, result["status"])
-        self.assertEqual(0, state["state_version"])
-        self.assertIn("Harness-owned keys", result["error"])
+        self.assertEqual(SUCCESS_NO_NOTIFY, result["status"])
+        self.assertEqual(1, state["state_version"])
+        self.assertEqual("/state_updates/0/namespace", result["validation_warnings"][0]["path"])
+        self.assertEqual({}, state["_runtime"]["notifications"])
         self.assertNotEqual({}, state["_runtime"]["processed_runs"])
 
     def test_notification_idempotency_dedup_and_duplicate_run(self) -> None:
@@ -999,7 +1565,11 @@ class ProductionRuntimeTests(unittest.TestCase):
             structured_result(
                 SUCCESS_NOTIFY,
                 event_key="must-not-send",
-                updates={"snapshot": {"breadth": "verified"}},
+                updates={
+                    "intraday_state": {
+                        "2026-08-19|09:45": {"breadth": "verified"}
+                    }
+                },
             ),
             sender=lambda *args, **kwargs: calls.append(kwargs),
             trigger_slot="09:45",
@@ -1008,7 +1578,10 @@ class ProductionRuntimeTests(unittest.TestCase):
         self.assertEqual(SUCCESS_NO_NOTIFY, result["status"])
         self.assertEqual("not_allowed_for_trigger", result["delivery_status"])
         self.assertEqual([], calls)
-        self.assertEqual({"breadth": "verified"}, state["snapshot"])
+        self.assertEqual(
+            {"breadth": "verified"},
+            state["intraday_state"]["2026-08-19|09:45"],
+        )
         self.assertEqual({}, state["_runtime"]["notifications"])
 
     def test_notification_trigger_requires_success_notify(self) -> None:
@@ -1778,6 +2351,46 @@ class CardRenderingTests(unittest.TestCase):
 
 
 class AdapterAndRetryTests(unittest.TestCase):
+    def test_feishu_readback_confirms_message_in_expected_task_chat(self) -> None:
+        reader = getattr(feishu_send, "read_message", None)
+        self.assertIsNotNone(reader, "Feishu adapter must expose message readback")
+        if reader is None:
+            return
+        task_chat_env = "FEISHU_CHAT_ID_A_SHARE_MONITOR_SCHEDULE_TASK"
+        responses = [
+            {"code": 0, "tenant_access_token": "tenant-token"},
+            {
+                "code": 0,
+                "data": {
+                    "items": [
+                        {
+                            "message_id": "om_verified",
+                            "chat_id": "a-share-chat-id",
+                            "msg_type": "interactive",
+                        }
+                    ]
+                },
+            },
+        ]
+        env = {
+            feishu_send.APP_ID_ENV_KEY: "shared-app-id",
+            feishu_send.APP_SECRET_ENV_KEY: "shared-app-secret",
+            task_chat_env: "a-share-chat-id",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(
+            feishu_send, "_request_get_json", side_effect=responses[1:]
+        ) as request_get, patch.object(
+            feishu_send, "_request_json", return_value=responses[0]
+        ):
+            result = reader("om_verified", chat_id_env=task_chat_env)
+
+        self.assertEqual("om_verified", result["message_id"])
+        self.assertEqual("a-share-chat-id", result["chat_id"])
+        self.assertEqual(
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_verified",
+            request_get.call_args.args[0],
+        )
+
     def test_feishu_adapter_pins_a_sent_message(self) -> None:
         responses = [
             {"code": 0, "tenant_access_token": "tenant-token"},

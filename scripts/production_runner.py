@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -21,13 +21,22 @@ from feishu_cards import (
     render_card,
     validate_presentation,
 )
-from feishu_send import FeishuDeliveryError, pin_message, send_message, upload_remote_image
+from feishu_send import (
+    FeishuDeliveryError,
+    pin_message,
+    read_message,
+    send_message,
+    upload_remote_image,
+)
 from task_runtime import (
     FAILED,
     SKIPPED,
     SUCCESS_NO_NOTIFY,
     SUCCESS_NOTIFY,
+    RESERVED_STATE_UPDATE_NAMESPACES,
     TaskRuntimeError,
+    TaskValidationError,
+    append_jsonl,
     atomic_write_json,
     build_agent_prompt,
     compact_state_context,
@@ -40,6 +49,8 @@ from task_runtime import (
     read_json_object,
     run_lock,
     validate_agent_result,
+    validate_result_schema,
+    validation_issue,
     write_run_outputs,
 )
 
@@ -48,14 +59,60 @@ AgentRunner = Callable[[str, Dict[str, Any], Path], Dict[str, Any]]
 DeliverySender = Callable[..., Dict[str, Any]]
 ImageUploader = Callable[[str], str]
 PinSender = Callable[[str], Dict[str, Any]]
-RESERVED_STATE_UPDATE_KEYS = {
-    "_runtime",
-    "schema_version",
-    "task_id",
-    "state_version",
-    "last_run_at",
-    "last_success_at",
-}
+RESERVED_STATE_UPDATE_KEYS = RESERVED_STATE_UPDATE_NAMESPACES
+
+
+def _validation_errors(exc: Exception) -> list[Dict[str, str]]:
+    if isinstance(exc, TaskValidationError):
+        return copy.deepcopy(exc.validation_errors)
+    rule = "card_validation" if isinstance(exc, CardSpecError) else "semantic_validation"
+    return [validation_issue("/", rule, _sanitize_error(str(exc)))]
+
+
+def _safe_reserved_state_downgrade(
+    raw_result: Any, errors: list[Dict[str, str]]
+) -> tuple[Optional[Dict[str, Any]], list[Dict[str, str]]]:
+    """Remove only explicit Harness-owned state fields after retries are exhausted."""
+
+    if not isinstance(raw_result, dict) or not errors:
+        return None, []
+    updates = raw_result.get("state_updates")
+    if not isinstance(updates, list):
+        return None, []
+    reserved_indices: list[int] = []
+    for issue in errors:
+        path = issue.get("path", "")
+        parts = path.strip("/").split("/")
+        if (
+            issue.get("rule") != "forbidden_property"
+            or len(parts) != 3
+            or parts[0] != "state_updates"
+            or parts[2] != "namespace"
+        ):
+            return None, []
+        try:
+            index = int(parts[1])
+            operation = updates[index]
+        except (IndexError, TypeError, ValueError):
+            return None, []
+        namespace = operation.get("namespace") if isinstance(operation, dict) else None
+        if namespace not in RESERVED_STATE_UPDATE_KEYS:
+            return None, []
+        reserved_indices.append(index)
+    if not reserved_indices:
+        return None, []
+    sanitized = copy.deepcopy(raw_result)
+    for index in sorted(set(reserved_indices), reverse=True):
+        sanitized["state_updates"].pop(index)
+    warnings = [
+        validation_issue(
+            f"/state_updates/{index}/namespace",
+            "reserved_property_removed",
+            "Harness removed its own reserved state field after correction retry",
+        )
+        for index in sorted(set(reserved_indices))
+    ]
+    return sanitized, warnings
 
 
 def _config_int(section: Dict[str, Any], key: str, default: int) -> int:
@@ -70,6 +127,89 @@ def _notification_allowed(delivery_config: Dict[str, Any], trigger_slot: str) ->
     if not isinstance(configured, list):
         return True
     return trigger_slot in {str(value) for value in configured}
+
+
+def _failure_alert_enabled(
+    delivery_config: Dict[str, Any], trigger_slot: str
+) -> bool:
+    """Return whether a failed scheduled slot must emit a deterministic alert."""
+
+    alert_config = delivery_config.get("failure_alert")
+    if not isinstance(alert_config, dict) or alert_config.get("enabled") is not True:
+        return False
+    trigger_slots = alert_config.get("trigger_slots")
+    return isinstance(trigger_slots, list) and trigger_slot in {
+        str(value) for value in trigger_slots
+    }
+
+
+def _ensure_failure_alert_pending(
+    *,
+    task_id: str,
+    task_name: str,
+    state: Dict[str, Any],
+    run_id: str,
+    scheduled_at: str,
+    trigger_slot: str,
+    error: str,
+    failure_stage: str,
+    output_json: str,
+    output_markdown: str,
+    created_at: str,
+) -> str:
+    """Persist one idempotent post alert before attempting external delivery."""
+
+    _, notifications = _runtime_maps(state)
+    event_key = f"automation-hub:failure:{task_id}:{run_id}"
+    fingerprint = notification_fingerprint(task_id, event_key)
+    existing = notifications.get(fingerprint)
+    if isinstance(existing, dict):
+        return fingerprint
+
+    title = f"[Automation Hub告警] {task_name} {trigger_slot} 未完成"
+    safe_error = _sanitize_error(error or "unknown task failure")
+    body_lines = [
+        f"任务：{task_name}（{task_id}）",
+        f"计划时间：{scheduled_at}",
+        f"触发时点：{trigger_slot}",
+        f"运行 ID：{run_id}",
+        f"失败阶段：{failure_stage}",
+        f"错误：{safe_error}",
+    ]
+    if output_json:
+        body_lines.append(f"JSON 结果：{output_json}")
+    if output_markdown:
+        body_lines.append(f"Markdown 结果：{output_markdown}")
+    body_lines.append(
+        "状态：主任务未完成；告警已由 Harness 记录，可据此排查和迭代。"
+    )
+    body = "\n".join(body_lines)
+    notifications[fingerprint] = {
+        "status": "pending",
+        "purpose": "failure_alert",
+        "run_id": run_id,
+        "trigger_slot": trigger_slot,
+        "event_key": event_key,
+        "title": title,
+        "body": body,
+        "idempotency_key": notification_idempotency_key(fingerprint),
+        "presentation": "post",
+        "messages": [
+            {
+                "kind": "post",
+                "status": "pending",
+                "title": title,
+                "body": body,
+                "idempotency_key": notification_idempotency_key(
+                    f"{fingerprint}:post:0"
+                ),
+            }
+        ],
+        "created_at": created_at,
+        "updated_at": created_at,
+        "last_error": None,
+    }
+    return fingerprint
 
 
 def _suppress_result_notification(value: Any) -> Any:
@@ -331,6 +471,23 @@ def _daily_archive_enabled(
     }
 
 
+def _readback_enabled(
+    delivery_config: Dict[str, Any],
+    trigger_slot: Optional[str],
+    *,
+    is_failure_alert: bool,
+) -> bool:
+    readback_config = delivery_config.get("readback")
+    if not isinstance(readback_config, dict) or readback_config.get("enabled") is not True:
+        return False
+    if is_failure_alert and readback_config.get("include_failure_alerts", True) is True:
+        return True
+    trigger_slots = readback_config.get("trigger_slots")
+    return isinstance(trigger_slots, list) and trigger_slot in {
+        str(value) for value in trigger_slots
+    }
+
+
 def _pin_daily_archive(
     *,
     notification: Dict[str, Any],
@@ -405,7 +562,10 @@ def _deliver_pending(
     if notification.get("status") == "sent":
         return "duplicate", False, None
     notification_trigger_slot = _notification_trigger_slot(state, notification)
-    if isinstance(delivery_config.get("notification_triggers"), list) and (
+    is_failure_alert = notification.get("purpose") == "failure_alert"
+    if not is_failure_alert and isinstance(
+        delivery_config.get("notification_triggers"), list
+    ) and (
         not notification_trigger_slot
         or not _notification_allowed(delivery_config, notification_trigger_slot)
     ):
@@ -435,6 +595,17 @@ def _deliver_pending(
         notification["messages"] = messages
 
     retry_attempts = _config_int(delivery_config, "retry_attempts", 2)
+    readback_required = _readback_enabled(
+        delivery_config,
+        notification_trigger_slot,
+        is_failure_alert=is_failure_alert,
+    )
+    readback_config = delivery_config.get("readback")
+    if readback_required and isinstance(readback_config, dict):
+        retry_attempts = max(
+            retry_attempts,
+            _config_int(readback_config, "retry_attempts", retry_attempts),
+        )
     route_kwargs: Dict[str, str] = {}
     chat_id_env = delivery_config.get("chat_id_env")
     if isinstance(chat_id_env, str) and chat_id_env:
@@ -447,62 +618,90 @@ def _deliver_pending(
             continue
         for attempt in range(1, retry_attempts + 1):
             try:
-                kind = message.get("kind")
-                if kind == "interactive":
-                    card_spec = message.get("card")
-                    if not isinstance(card_spec, dict):
-                        raise TaskRuntimeError("pending card specification is invalid")
-                    image_url = card_spec.get("image_url")
-                    if (
-                        isinstance(image_url, str)
-                        and image_url
-                        and not message.get("image_key")
-                        and message.get("image_status") != "skipped"
-                    ):
+                response_message_id = message.get("message_id")
+                if not isinstance(response_message_id, str) or not response_message_id:
+                    kind = message.get("kind")
+                    if kind == "interactive":
+                        card_spec = message.get("card")
+                        if not isinstance(card_spec, dict):
+                            raise TaskRuntimeError(
+                                "pending card specification is invalid"
+                            )
+                        image_url = card_spec.get("image_url")
+                        if (
+                            isinstance(image_url, str)
+                            and image_url
+                            and not message.get("image_key")
+                            and message.get("image_status") != "skipped"
+                        ):
+                            try:
+                                message["image_key"] = image_uploader(image_url)
+                                message["image_status"] = "uploaded"
+                            except (FeishuDeliveryError, OSError) as image_exc:
+                                message["image_status"] = "skipped"
+                                message["image_error"] = _sanitize_error(str(image_exc))
+                            atomic_write_json(state_path, state)
                         try:
-                            message["image_key"] = image_uploader(image_url)
-                            message["image_status"] = "uploaded"
-                        except (FeishuDeliveryError, OSError) as image_exc:
-                            message["image_status"] = "skipped"
-                            message["image_error"] = _sanitize_error(str(image_exc))
-                        atomic_write_json(state_path, state)
-                    try:
-                        card_payload = render_card(
-                            card_spec,
-                            image_key=str(message.get("image_key") or ""),
+                            card_payload = render_card(
+                                card_spec,
+                                image_key=str(message.get("image_key") or ""),
+                            )
+                        except CardSpecError as exc:
+                            raise TaskRuntimeError(str(exc)) from exc
+                        response = delivery_sender(
+                            "",
+                            message_type="interactive",
+                            card=card_payload,
+                            idempotency_key=str(message["idempotency_key"]),
+                            **route_kwargs,
                         )
-                    except CardSpecError as exc:
-                        raise TaskRuntimeError(str(exc)) from exc
-                    response = delivery_sender(
-                        "",
-                        message_type="interactive",
-                        card=card_payload,
-                        idempotency_key=str(message["idempotency_key"]),
-                        **route_kwargs,
+                    elif kind == "post":
+                        response = delivery_sender(
+                            str(message.get("body", notification.get("body", ""))),
+                            message_type="post",
+                            title=str(
+                                message.get("title", notification.get("title", ""))
+                            ),
+                            idempotency_key=str(message["idempotency_key"]),
+                            **route_kwargs,
+                        )
+                    else:
+                        raise TaskRuntimeError("pending notification kind is invalid")
+                    if not isinstance(response, dict):
+                        raise TaskRuntimeError(
+                            "delivery adapter returned an invalid response"
+                        )
+                    response_message_id = response.get("message_id")
+                    if (
+                        not isinstance(response_message_id, str)
+                        or not response_message_id
+                    ):
+                        raise TaskRuntimeError(
+                            "delivery adapter returned no non-empty message_id"
+                        )
+                    message["message_id"] = response_message_id
+                    message["delivery_accepted_at"] = now_in(timezone_name).isoformat(
+                        timespec="seconds"
                     )
-                elif kind == "post":
-                    response = delivery_sender(
-                        str(message.get("body", notification.get("body", ""))),
-                        message_type="post",
-                        title=str(
-                            message.get("title", notification.get("title", ""))
-                        ),
-                        idempotency_key=str(message["idempotency_key"]),
-                        **route_kwargs,
+                    atomic_write_json(state_path, state)
+                if readback_required:
+                    readback = read_message(response_message_id, **route_kwargs)
+                    if (
+                        not isinstance(readback, dict)
+                        or readback.get("message_id") != response_message_id
+                    ):
+                        raise TaskRuntimeError(
+                            "Feishu readback returned a different message_id"
+                        )
+                    message["readback_status"] = "verified"
+                    message["readback_at"] = now_in(timezone_name).isoformat(
+                        timespec="seconds"
                     )
                 else:
-                    raise TaskRuntimeError("pending notification kind is invalid")
-                if not isinstance(response, dict):
-                    raise TaskRuntimeError("delivery adapter returned an invalid response")
-                response_message_id = response.get("message_id")
-                if not isinstance(response_message_id, str) or not response_message_id:
-                    raise TaskRuntimeError(
-                        "delivery adapter returned no non-empty message_id"
-                    )
+                    message["readback_status"] = "not_configured"
                 message_sent_at = now_in(timezone_name).isoformat(timespec="seconds")
                 message["status"] = "sent"
                 message["sent_at"] = message_sent_at
-                message["message_id"] = response_message_id
                 message["last_error"] = None
                 notification["updated_at"] = message_sent_at
                 notification["last_error"] = None
@@ -510,6 +709,8 @@ def _deliver_pending(
                 break
             except (FeishuDeliveryError, OSError, TaskRuntimeError) as exc:
                 last_error = _sanitize_error(str(exc))
+                if message.get("message_id") and readback_required:
+                    message["readback_status"] = "failed"
                 message["last_error"] = last_error
                 notification["last_error"] = last_error
                 notification["updated_at"] = now_in(timezone_name).isoformat(
@@ -521,14 +722,15 @@ def _deliver_pending(
         if message.get("status") != "sent":
             return "failed", False, last_error
 
-    _pin_daily_archive(
-        notification=notification,
-        messages=messages,
-        delivery_config=delivery_config,
-        trigger_slot=notification_trigger_slot,
-        timezone_name=timezone_name,
-        pin_sender=pin_sender,
-    )
+    if not is_failure_alert:
+        _pin_daily_archive(
+            notification=notification,
+            messages=messages,
+            delivery_config=delivery_config,
+            trigger_slot=notification_trigger_slot,
+            timezone_name=timezone_name,
+            pin_sender=pin_sender,
+        )
 
     sent_at = now_in(timezone_name).isoformat(timespec="seconds")
     notification["status"] = "sent"
@@ -538,13 +740,14 @@ def _deliver_pending(
         message.get("message_id") for message in messages if message.get("message_id")
     ]
     notification["last_error"] = None
-    _append_notification_history(
-        state,
-        fingerprint=fingerprint,
-        event_key=str(notification["event_key"]),
-        run_id=str(notification["run_id"]),
-        sent_at=sent_at,
-    )
+    if not is_failure_alert:
+        _append_notification_history(
+            state,
+            fingerprint=fingerprint,
+            event_key=str(notification["event_key"]),
+            run_id=str(notification["run_id"]),
+            sent_at=sent_at,
+        )
     prune_runtime(state)
     atomic_write_json(state_path, state)
     return "ok", True, None
@@ -596,6 +799,184 @@ def recover_pending_delivery(
         "failed": failed,
         "error": "; ".join(errors)[:2000] or None,
     }
+
+
+def monitor_scheduled_deliveries(
+    *,
+    repo_root: Path,
+    config: Dict[str, Any],
+    at: datetime,
+    dry_run_delivery: bool = False,
+    delivery_sender: Optional[DeliverySender] = None,
+) -> list[Dict[str, Any]]:
+    """Alert once when a monitored notification slot misses its terminal contract."""
+
+    delivery_config = (
+        config.get("delivery") if isinstance(config.get("delivery"), dict) else {}
+    )
+    monitor_config = delivery_config.get("completion_monitor")
+    if (
+        not isinstance(monitor_config, dict)
+        or monitor_config.get("enabled") is not True
+    ):
+        return []
+    trigger_slots = monitor_config.get("trigger_slots")
+    if not isinstance(trigger_slots, list):
+        return []
+    timezone_name = str(config["schedule"]["timezone"])
+    local_at = at.astimezone(now_in(timezone_name).tzinfo)
+    grace_minutes = _config_int(monitor_config, "grace_minutes", 10)
+    state_path = (repo_root / str(config["state"]["path"])).resolve()
+    state = read_json_object(state_path)
+    processed, notifications = _runtime_maps(state)
+    runtime = state.setdefault("_runtime", {})
+    health_checks = runtime.setdefault("health_checks", {})
+    if not isinstance(health_checks, dict):
+        health_checks = {}
+        runtime["health_checks"] = health_checks
+    incidents: list[Dict[str, Any]] = []
+    health_log = repo_root / "logs" / "scheduler" / "health.jsonl"
+
+    for raw_slot in trigger_slots:
+        trigger_slot = str(raw_slot)
+        hour, minute = (int(part) for part in trigger_slot.split(":"))
+        scheduled_at = local_at.replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if local_at < scheduled_at + timedelta(minutes=grace_minutes):
+            continue
+        scheduled_text = scheduled_at.isoformat(timespec="seconds")
+        run_id = make_run_id(str(config["id"]), scheduled_text, trigger_slot)
+        if run_id in health_checks:
+            continue
+        prior = processed.get(run_id)
+        reason: Optional[str] = None
+        detail = ""
+        if not isinstance(prior, dict):
+            reason = "missing_run"
+            detail = "宽限期结束后没有运行记录"
+        elif prior.get("terminal") is not True:
+            reason = "incomplete_run"
+            detail = "宽限期结束后任务仍未进入终态"
+        elif prior.get("status") == FAILED:
+            reason = "failed_run"
+            detail = str(prior.get("error") or "任务以 FAILED 结束")
+        elif prior.get("status") == SKIPPED and str(
+            prior.get("skip_reason") or ""
+        ).strip():
+            reason = None
+        elif prior.get("status") == SUCCESS_NOTIFY:
+            fingerprint = prior.get("notification_fingerprint")
+            notification = (
+                notifications.get(fingerprint)
+                if isinstance(fingerprint, str)
+                else None
+            )
+            if not isinstance(notification, dict) or notification.get("status") not in {
+                "sent",
+                "pending",
+            }:
+                reason = "missing_delivery_state"
+                detail = "通知时点没有 sent 或 pending 投递记录"
+        else:
+            reason = "invalid_terminal_state"
+            detail = f"通知时点终态不合法：{prior.get('status')}"
+
+        checked_at = local_at.isoformat(timespec="seconds")
+        if reason is None:
+            health_checks[run_id] = {
+                "status": "healthy",
+                "checked_at": checked_at,
+                "trigger_slot": trigger_slot,
+            }
+            atomic_write_json(state_path, state)
+            append_jsonl(
+                health_log,
+                {
+                    "task": str(config["id"]),
+                    "run_id": run_id,
+                    "trigger_slot": trigger_slot,
+                    "status": "healthy",
+                    "checked_at": checked_at,
+                },
+            )
+            continue
+
+        alert_status = "not_configured"
+        alert_error: Optional[str] = None
+        fingerprint: Optional[str] = None
+        if _failure_alert_enabled(delivery_config, trigger_slot):
+            fingerprint = _ensure_failure_alert_pending(
+                task_id=str(config["id"]),
+                task_name=str(config["name"]),
+                state=state,
+                run_id=run_id,
+                scheduled_at=scheduled_text,
+                trigger_slot=trigger_slot,
+                error=detail,
+                failure_stage="scheduler_completion_monitor",
+                output_json=str(prior.get("output_json") or "")
+                if isinstance(prior, dict)
+                else "",
+                output_markdown=str(prior.get("output_markdown") or "")
+                if isinstance(prior, dict)
+                else "",
+                created_at=checked_at,
+            )
+            atomic_write_json(state_path, state)
+            alert_notification = notifications.get(fingerprint)
+            if (
+                isinstance(alert_notification, dict)
+                and alert_notification.get("status") == "sent"
+            ):
+                alert_status = "sent"
+            elif (
+                delivery_config.get("type") == "feishu"
+                and delivery_config.get("enabled") is True
+                and delivery_config.get("policy", "conditional") != "never"
+            ):
+                delivery_status, sent, alert_error = _deliver_pending(
+                    task_id=str(config["id"]),
+                    state=state,
+                    state_path=state_path,
+                    fingerprint=fingerprint,
+                    delivery_config=delivery_config,
+                    timezone_name=timezone_name,
+                    dry_run_delivery=dry_run_delivery,
+                    delivery_sender=delivery_sender or send_message,
+                    image_uploader=upload_remote_image,
+                )
+                alert_status = (
+                    "sent"
+                    if sent
+                    else "dry_run"
+                    if delivery_status == "dry_run"
+                    else "pending"
+                )
+            else:
+                alert_status = "pending"
+
+        health_checks[run_id] = {
+            "status": "alerted" if alert_status == "sent" else "alert_pending",
+            "reason": reason,
+            "checked_at": checked_at,
+            "trigger_slot": trigger_slot,
+            "failure_alert_fingerprint": fingerprint,
+        }
+        atomic_write_json(state_path, state)
+        incident = {
+            "task": str(config["id"]),
+            "run_id": run_id,
+            "trigger_slot": trigger_slot,
+            "status": "failed",
+            "reason": reason,
+            "alert_status": alert_status,
+            "alert_error": alert_error,
+            "checked_at": checked_at,
+        }
+        incidents.append(incident)
+        append_jsonl(health_log, incident)
+    return incidents
 
 
 def execute_production_task(
@@ -737,9 +1118,25 @@ def execute_production_task(
             evidence_context=workflow_evidence,
         )
 
+        validation_warnings: list[Dict[str, str]] = []
         try:
             validation_attempts = 1 if result_file is not None else 2
             current_prompt = agent_prompt
+            configured_update_keys = config.get("state", {}).get(
+                "allowed_update_keys"
+            )
+            allowed_update_keys = (
+                [str(value) for value in configured_update_keys]
+                if isinstance(configured_update_keys, list)
+                else None
+            )
+            schema_path = repo_root / "config" / "task-result.schema.json"
+            if not schema_path.is_file():
+                schema_path = (
+                    Path(__file__).resolve().parents[1]
+                    / "config"
+                    / "task-result.schema.json"
+                )
             for validation_attempt in range(1, validation_attempts + 1):
                 raw_result = (
                     _load_result_file(result_file)
@@ -748,10 +1145,28 @@ def execute_production_task(
                         current_prompt, config, repo_root
                     )
                 )
-                if not notification_allowed:
-                    raw_result = _suppress_result_notification(raw_result)
                 try:
-                    result, state_updates = validate_agent_result(raw_result)
+                    try:
+                        validate_result_schema(raw_result, schema_path)
+                    except TaskValidationError as schema_exc:
+                        if validation_attempt < validation_attempts:
+                            raise
+                        downgraded, downgrade_warnings = (
+                            _safe_reserved_state_downgrade(
+                                raw_result, schema_exc.validation_errors
+                            )
+                        )
+                        if downgraded is None:
+                            raise
+                        raw_result = downgraded
+                        validation_warnings.extend(downgrade_warnings)
+                        validate_result_schema(raw_result, schema_path)
+                    if not notification_allowed:
+                        raw_result = _suppress_result_notification(raw_result)
+                    result, state_updates = validate_agent_result(
+                        raw_result,
+                        allowed_state_update_keys=allowed_update_keys,
+                    )
                     if (
                         notification_allowed
                         and isinstance(
@@ -778,19 +1193,37 @@ def execute_production_task(
                         RESERVED_STATE_UPDATE_KEYS.intersection(state_updates)
                     )
                     if reserved:
-                        raise TaskRuntimeError(
-                            "state updates contain Harness-owned keys: "
-                            + ", ".join(reserved)
+                        raise TaskValidationError(
+                            [
+                                validation_issue(
+                                    f"/state_updates/{key}",
+                                    "forbidden_property",
+                                    "该字段由 Harness 自动维护",
+                                )
+                                for key in reserved
+                            ]
                         )
                     break
                 except (CardSpecError, TaskRuntimeError) as validation_exc:
+                    machine_errors = _validation_errors(validation_exc)
                     if validation_attempt >= validation_attempts:
-                        raise TaskRuntimeError(str(validation_exc)) from validation_exc
+                        raise TaskRuntimeError(
+                            json.dumps(
+                                {"validation_errors": machine_errors},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ) from validation_exc
                     current_prompt = (
                         agent_prompt
-                        + "\n\nThe previous structured result was rejected by the Harness: "
-                        + _sanitize_error(str(validation_exc))
-                        + "\nReturn a corrected complete JSON object. Do not reuse the invalid shape."
+                        + "\n\nThe previous structured result was rejected. Correct every "
+                        "machine-readable error below and return one complete JSON object:\n"
+                        + json.dumps(
+                            {"validation_errors": machine_errors},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + "\nDo not reuse the invalid shape or alter verified market facts."
                     )
         except (OSError, TaskRuntimeError) as exc:
             result = {
@@ -798,7 +1231,7 @@ def execute_production_task(
                 "should_notify": False,
                 "summary": "",
                 "output_markdown": "",
-                "state_updates_json": "{}",
+                "state_updates": [],
                 "notification": {
                     "title": "",
                     "body": "",
@@ -821,6 +1254,7 @@ def execute_production_task(
             "finished_at": finished_at_text,
             "trigger_slot": trigger_slot,
             "result": result,
+            "validation_warnings": validation_warnings,
         }
         timestamp_slug = finished_at.strftime("%Y%m%dT%H%M%S%z")
         json_path, markdown_path = write_run_outputs(
@@ -927,6 +1361,8 @@ def execute_production_task(
                 "output_json": str(json_path.relative_to(repo_root)),
                 "output_markdown": str(markdown_path.relative_to(repo_root)),
                 "notification_fingerprint": fingerprint,
+                "validation_warnings": validation_warnings,
+                "skip_reason": str(result.get("skip_reason") or ""),
             }
             prune_runtime(new_state)
             atomic_write_json(state_path, new_state)
@@ -968,10 +1404,79 @@ def execute_production_task(
                 "output_json": str(json_path.relative_to(repo_root)),
                 "output_markdown": str(markdown_path.relative_to(repo_root)),
                 "error": str(result["error"]),
+                "validation_warnings": validation_warnings,
             }
             prune_runtime(state)
             atomic_write_json(state_path, state)
             delivery_error = str(result["error"])
+
+        failure_alert_status = "not_configured"
+        failure_alert_error: Optional[str] = None
+        failure_alert_fingerprint: Optional[str] = None
+        if status == FAILED and _failure_alert_enabled(delivery_config, trigger_slot):
+            failure_stage = (
+                "feishu_delivery"
+                if delivery_status == "failed"
+                else "sampling_agent_or_validation"
+            )
+            failure_alert_fingerprint = _ensure_failure_alert_pending(
+                task_id=task_id,
+                task_name=task_name,
+                state=state,
+                run_id=run_id,
+                scheduled_at=scheduled_at_text,
+                trigger_slot=trigger_slot,
+                error=delivery_error or str(result.get("error") or ""),
+                failure_stage=failure_stage,
+                output_json=str(json_path.relative_to(repo_root)),
+                output_markdown=str(markdown_path.relative_to(repo_root)),
+                created_at=finished_at_text,
+            )
+            processed, _ = _runtime_maps(state)
+            failed_run = processed.get(run_id)
+            if isinstance(failed_run, dict):
+                failed_run["failure_alert_fingerprint"] = failure_alert_fingerprint
+            atomic_write_json(state_path, state)
+            if (
+                delivery_config.get("enabled")
+                and delivery_config.get("type") == "feishu"
+                and delivery_config.get("policy", "conditional") != "never"
+            ):
+                alert_delivery_status, alert_sent, failure_alert_error = _deliver_pending(
+                    task_id=task_id,
+                    state=state,
+                    state_path=state_path,
+                    fingerprint=failure_alert_fingerprint,
+                    delivery_config=delivery_config,
+                    timezone_name=timezone_name,
+                    dry_run_delivery=dry_run_delivery,
+                    delivery_sender=delivery_sender,
+                    image_uploader=image_uploader,
+                    pin_sender=pin_sender,
+                )
+                if alert_sent:
+                    failure_alert_status = "sent"
+                elif alert_delivery_status == "dry_run":
+                    failure_alert_status = "dry_run"
+                else:
+                    failure_alert_status = "pending"
+            else:
+                failure_alert_status = "pending"
+            append_jsonl(
+                repo_root / "logs" / "scheduler" / "health.jsonl",
+                {
+                    "task": task_id,
+                    "run_id": run_id,
+                    "trigger_slot": trigger_slot,
+                    "status": "failed",
+                    "reason": "run_failed",
+                    "alert_status": failure_alert_status,
+                    "alert_error": failure_alert_error,
+                    "checked_at": now_in(timezone_name).isoformat(
+                        timespec="seconds"
+                    ),
+                },
+            )
 
         envelope["final"] = {
             "status": status,
@@ -979,6 +1484,9 @@ def execute_production_task(
             "notification_sent": notification_sent,
             "delivery_status": delivery_status,
             "error": delivery_error,
+            "failure_alert_status": failure_alert_status,
+            "failure_alert_error": failure_alert_error,
+            "validation_warnings": validation_warnings,
         }
         atomic_write_json(json_path, envelope)
         return {
@@ -993,4 +1501,7 @@ def execute_production_task(
             "output_json": str(json_path.relative_to(repo_root)),
             "output_markdown": str(markdown_path.relative_to(repo_root)),
             "error": delivery_error,
+            "failure_alert_status": failure_alert_status,
+            "failure_alert_error": failure_alert_error,
+            "validation_warnings": validation_warnings,
         }

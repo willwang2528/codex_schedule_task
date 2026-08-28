@@ -28,10 +28,160 @@ RESULT_STATUSES = {
     SKIPPED,
     FAILED,
 }
+RESERVED_STATE_UPDATE_NAMESPACES = {
+    "_runtime",
+    "schema_version",
+    "task_id",
+    "state_version",
+    "last_run_at",
+    "last_success_at",
+}
 
 
 class TaskRuntimeError(RuntimeError):
     """Raised when a run cannot be safely prepared or finalized."""
+
+
+class TaskValidationError(TaskRuntimeError):
+    """Structured Schema/Harness rejection safe to return to the Agent."""
+
+    def __init__(self, validation_errors: List[Dict[str, str]]) -> None:
+        self.validation_errors = copy.deepcopy(validation_errors)
+        super().__init__(
+            json.dumps(
+                {"validation_errors": self.validation_errors},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+
+def validation_issue(path: str, rule: str, message: str) -> Dict[str, str]:
+    return {"path": path or "/", "rule": rule, "message": message}
+
+
+def _json_pointer(path: str, value: Any) -> str:
+    token = str(value).replace("~", "~0").replace("/", "~1")
+    return f"{path}/{token}" if path else f"/{token}"
+
+
+def _matches_json_type(value: Any, expected: str) -> bool:
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return True
+
+
+def _collect_schema_errors(
+    value: Any, schema: Dict[str, Any], *, path: str = ""
+) -> List[Dict[str, str]]:
+    """Validate the JSON Schema keywords used by the task result contract."""
+
+    errors: List[Dict[str, str]] = []
+    expected = schema.get("type")
+    if isinstance(expected, str) and not _matches_json_type(value, expected):
+        return [
+            validation_issue(
+                path or "/",
+                "type",
+                f"expected {expected}, received {type(value).__name__}",
+            )
+        ]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        errors.append(
+            validation_issue(path or "/", "enum", "value is not in the allowed enum")
+        )
+    if isinstance(value, dict):
+        required = schema.get("required")
+        if isinstance(required, list):
+            for key in required:
+                if key not in value:
+                    errors.append(
+                        validation_issue(
+                            _json_pointer(path, key),
+                            "required",
+                            "required property is missing",
+                        )
+                    )
+        properties = schema.get("properties")
+        property_schemas = properties if isinstance(properties, dict) else {}
+        if schema.get("additionalProperties") is False:
+            for key in sorted(set(value).difference(property_schemas)):
+                errors.append(
+                    validation_issue(
+                        _json_pointer(path, key),
+                        "forbidden_property",
+                        "property is not allowed by the strict result schema",
+                    )
+                )
+        for key, child in value.items():
+            child_schema = property_schemas.get(key)
+            if isinstance(child_schema, dict):
+                errors.extend(
+                    _collect_schema_errors(
+                        child,
+                        child_schema,
+                        path=_json_pointer(path, key),
+                    )
+                )
+    if isinstance(value, list):
+        minimum = schema.get("minItems")
+        maximum = schema.get("maxItems")
+        if isinstance(minimum, int) and len(value) < minimum:
+            errors.append(
+                validation_issue(path or "/", "minItems", f"requires at least {minimum} items")
+            )
+        if isinstance(maximum, int) and len(value) > maximum:
+            errors.append(
+                validation_issue(path or "/", "maxItems", f"allows at most {maximum} items")
+            )
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, child in enumerate(value):
+                errors.extend(
+                    _collect_schema_errors(
+                        child,
+                        item_schema,
+                        path=_json_pointer(path, index),
+                    )
+                )
+    return errors
+
+
+def validate_result_schema(value: Any, schema_path: Path) -> None:
+    """Apply the checked-in strict result schema before business validation."""
+
+    schema = read_json_object(schema_path)
+    errors = _collect_schema_errors(value, schema)
+    updates = value.get("state_updates") if isinstance(value, dict) else None
+    if isinstance(updates, list):
+        for issue in errors:
+            path = issue.get("path", "")
+            parts = path.strip("/").split("/")
+            if len(parts) != 3 or parts[0] != "state_updates" or parts[2] != "namespace":
+                continue
+            try:
+                operation = updates[int(parts[1])]
+            except (IndexError, TypeError, ValueError):
+                continue
+            namespace = operation.get("namespace") if isinstance(operation, dict) else None
+            if namespace in RESERVED_STATE_UPDATE_NAMESPACES:
+                issue["rule"] = "forbidden_property"
+                issue["message"] = "该字段由 Harness 自动维护"
+    if errors:
+        raise TaskValidationError(errors)
 
 
 def now_in(timezone_name: str) -> datetime:
@@ -191,7 +341,7 @@ Rules:
 4. Treat stale, unavailable, or untrusted data as unavailable. Never replace trusted state with failed/null data.
 5. Return only the JSON object required by the supplied output schema.
 6. Do not edit TASK.md, state, outputs, logs, or configuration. Do not send Feishu messages. The Harness owns persistence and delivery.
-7. state_updates_json must contain only validated domain-state updates as a JSON object string. Use "{{}}" on failure.
+7. state_updates must be a strict operation array. Each item must contain namespace, operation="upsert", and value_json containing one valid JSON value. Use only task-allowed domain namespaces. Never target Harness-owned fields such as last_run_at, last_success_at, state_version, task_id, schema_version, or _runtime. Use [] when no state update is needed or on failure.
 8. SUCCESS_NOTIFY requires a stable business event_key that does not depend on prose wording. SUCCESS_NO_NOTIFY means a successful run with no meaningful notification. SKIPPED is a valid no-op such as a non-trading day. FAILED is only a real execution failure.
 9. When should_notify is false, notification title/body/event_key must be empty strings and notification.cards must be an empty array.
 10. If more history is required, read the full state file; do not copy its complete history into the result.
@@ -214,7 +364,9 @@ Business prompt ends.
 """
 
 
-def validate_agent_result(value: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def validate_agent_result(
+    value: Any, *, allowed_state_update_keys: Optional[List[str]] = None
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if not isinstance(value, dict):
         raise TaskRuntimeError("agent result must be a JSON object")
     required = {
@@ -222,7 +374,7 @@ def validate_agent_result(value: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "should_notify",
         "summary",
         "output_markdown",
-        "state_updates_json",
+        "state_updates",
         "notification",
         "skip_reason",
         "error",
@@ -240,7 +392,7 @@ def validate_agent_result(value: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         raise TaskRuntimeError("agent result should_notify must be boolean")
     if (status == SUCCESS_NOTIFY) != should_notify:
         raise TaskRuntimeError("status and should_notify are inconsistent")
-    for key in ("summary", "output_markdown", "state_updates_json", "skip_reason", "error"):
+    for key in ("summary", "output_markdown", "skip_reason", "error"):
         if not isinstance(value.get(key), str):
             raise TaskRuntimeError(f"agent result {key} must be a string")
     if status in {SUCCESS_NOTIFY, SUCCESS_NO_NOTIFY} and not value["summary"].strip():
@@ -275,14 +427,107 @@ def validate_agent_result(value: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     ):
         raise TaskRuntimeError("notification fields must be empty when not notifying")
 
-    try:
-        state_updates = json.loads(value["state_updates_json"])
-    except json.JSONDecodeError as exc:
-        raise TaskRuntimeError("state_updates_json must contain valid JSON") from exc
-    if not isinstance(state_updates, dict):
-        raise TaskRuntimeError("state_updates_json must contain a JSON object")
-    if status == FAILED and state_updates:
-        raise TaskRuntimeError("failed runs cannot update domain state")
+    state_update_operations = value.get("state_updates")
+    if not isinstance(state_update_operations, list):
+        raise TaskValidationError(
+            [validation_issue("/state_updates", "type", "state_updates must be an array")]
+        )
+    state_updates: Dict[str, Any] = {}
+    operation_errors: List[Dict[str, str]] = []
+    for index, operation in enumerate(state_update_operations):
+        operation_path = f"/state_updates/{index}"
+        if not isinstance(operation, dict):
+            operation_errors.append(
+                validation_issue(operation_path, "type", "state update must be an object")
+            )
+            continue
+        if set(operation) != {"namespace", "operation", "value_json"}:
+            operation_errors.append(
+                validation_issue(
+                    operation_path,
+                    "operation_shape",
+                    "state update must contain namespace, operation, and value_json",
+                )
+            )
+            continue
+        namespace = operation.get("namespace")
+        if not isinstance(namespace, str) or not namespace:
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/namespace",
+                    "type",
+                    "state namespace must be a non-empty string",
+                )
+            )
+            continue
+        if namespace in RESERVED_STATE_UPDATE_NAMESPACES:
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/namespace",
+                    "forbidden_property",
+                    "该字段由 Harness 自动维护",
+                )
+            )
+            continue
+        if allowed_state_update_keys is not None and namespace not in allowed_state_update_keys:
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/namespace",
+                    "forbidden_namespace",
+                    "state namespace is not allowed for this task",
+                )
+            )
+            continue
+        if namespace in state_updates:
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/namespace",
+                    "duplicate_namespace",
+                    "each state namespace may be updated at most once",
+                )
+            )
+            continue
+        if operation.get("operation") != "upsert":
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/operation",
+                    "enum",
+                    "state operation must be upsert",
+                )
+            )
+            continue
+        value_json = operation.get("value_json")
+        if not isinstance(value_json, str):
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/value_json",
+                    "type",
+                    "state update value_json must be a string",
+                )
+            )
+            continue
+        try:
+            state_updates[namespace] = json.loads(value_json)
+        except json.JSONDecodeError as exc:
+            operation_errors.append(
+                validation_issue(
+                    f"{operation_path}/value_json",
+                    "invalid_json",
+                    f"value_json must contain one valid JSON value: {exc.msg}",
+                )
+            )
+    if operation_errors:
+        raise TaskValidationError(operation_errors)
+    if status == FAILED and state_update_operations:
+        raise TaskValidationError(
+            [
+                validation_issue(
+                    "/state_updates",
+                    "failed_state_update",
+                    "failed runs cannot update domain state",
+                )
+            ]
+        )
 
     metadata = value.get("source_metadata")
     if not isinstance(metadata, list):

@@ -19,7 +19,7 @@
 - `14:30`：尾盘快照。保存指数、成交、尾盘资金方向、涨跌停/炸板变化、冲高回落和可能影响收盘的异动。
 - `15:01`：收盘复盘并发送三张卡；比较 `14:30` 和可核验的前一交易日，回答全天方向、量价、广度、情绪结构、主线、风险和下一交易日待验证问题。
 
-每个成功时点都把不含凭据的可信快照写入 `state_updates_json.intraday_state[交易日|trigger_slot]`，至少保存数据时间、指数方向、成交额、广度、涨跌停/炸板/连板及来源核验状态。白名单之外的运行仍必须产出本地 `summary` 与 `output_markdown`，使后续通知时点可以做阶段比较。
+每个成功时点都把不含凭据的可信快照通过 `state_updates` 严格操作列表写入 `intraday_state[交易日|trigger_slot]`，至少保存数据时间、指数方向、成交额、广度、涨跌停/炸板/连板及来源核验状态。每项必须是 `{"namespace":"intraday_state","operation":"upsert","value_json":"<一个合法 JSON 值>"}` 这一形态；允许的 namespace 只有 `intraday_state`、`completed_trigger_slots_add`、`trading_date`。不得把 `last_run_at`、`last_success_at`、`state_version`、`task_id`、`schema_version` 或 `_runtime` 作为 namespace。无更新时返回空列表。白名单之外的运行仍必须产出本地 `summary` 与 `output_markdown`，使后续通知时点可以做阶段比较。
 
 ## 用户问题与复盘模块
 

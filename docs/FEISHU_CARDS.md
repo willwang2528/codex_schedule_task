@@ -16,6 +16,10 @@ Task A separately configures `delivery.notification_triggers: ["09:35", "11:20",
 
 Task A also enables `delivery.daily_archive` only for `15:01`. After all three original cards are delivered, the Harness Pins the first `盘面总览` card. The group-wide Pin list therefore contains one closing-review entry per trading day; selecting it returns the reader to the three adjacent closing cards. Pin failure is stored under the notification's `daily_archive` state and never downgrades successful card delivery.
 
+Failure alerts intentionally use a single deterministic rich-text Post instead of an Agent-generated card. This keeps the alert path independent from card-schema failures. The Post includes task, scheduled time, trigger slot, run ID, sanitized stage/error, and local output paths. It has its own pending state and idempotency key, bypasses Task A's normal notification time allowlist, and is excluded from the business notification history and daily Pin archive.
+
+For Task A, HTTP send acceptance is not the final delivery state. The Harness saves the returned `message_id`, then reads that exact message back and verifies its `chat_id` against `FEISHU_CHAT_ID_A_SHARE_MONITOR_SCHEDULE_TASK`. Until that succeeds the message stays pending. Recovery retries only the readback when the accepted message ID is already present, avoiding duplicate cards.
+
 ## Semantic card contract
 
 Each card contains:

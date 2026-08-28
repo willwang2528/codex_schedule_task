@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+import production_runner
 from task_runtime import TaskRuntimeError, make_run_id, read_json_object
 from validate_task import (
     TaskConfigError,
@@ -154,7 +155,13 @@ def run_once(
     due = due_runs(repo_root, at)
     results: List[Dict[str, Any]] = []
     if dry_run:
-        return {"status": "ok", "at": at.isoformat(), "due": due, "results": []}
+        return {
+            "status": "ok",
+            "at": at.isoformat(),
+            "due": due,
+            "results": [],
+            "monitoring": [],
+        }
 
     runner = repo_root / "scripts" / "run_task.py"
     if recover_pending:
@@ -182,13 +189,40 @@ def run_once(
                 repo_root,
             )
         )
+    monitoring: List[Dict[str, Any]] = []
+    for task in tasks:
+        if not task["enabled"]:
+            continue
+        config_path = repo_root / str(task["config_path"])
+        config = load_task_config(config_path)
+        try:
+            monitoring.extend(
+                production_runner.monitor_scheduled_deliveries(
+                    repo_root=repo_root,
+                    config=config,
+                    at=at,
+                )
+            )
+        except (OSError, TaskRuntimeError) as exc:
+            monitoring.append(
+                {
+                    "task": task["id"],
+                    "status": "failed",
+                    "reason": "monitor_error",
+                    "error": " ".join(str(exc).split())[:2000],
+                }
+            )
     failed = [result for result in results if result.get("return_code") != 0]
+    monitoring_failed = [
+        result for result in monitoring if result.get("status") == "failed"
+    ]
     return {
-        "status": "failed" if failed else "ok",
+        "status": "failed" if failed or monitoring_failed else "ok",
         "at": at.isoformat(),
         "due": due,
         "results": results,
-        "failed_count": len(failed),
+        "monitoring": monitoring,
+        "failed_count": len(failed) + len(monitoring_failed),
     }
 
 

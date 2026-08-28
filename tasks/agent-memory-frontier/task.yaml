@@ -37,6 +37,7 @@ state:
   enabled: true
   path: state/agent-memory-frontier.json
   context_recent_items: 40
+  allowed_update_keys: ["last_notified_at", "last_seen_at", "paper_registry", "paper_status", "paper_versions", "reported_items"]
 
 logging:
   directory: logs/agent-memory-frontier

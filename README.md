@@ -75,6 +75,10 @@ FEISHU_CHAT_ID_SCHEDULE_TASK
 
 需要“所有时点采集、仅部分时点通知”时，在 `delivery.notification_triggers` 设置通知白名单。Task A 固定为 `["09:35", "11:20", "15:01"]`；其他时点仍生成输出和状态，但 Harness 不创建或恢复飞书通知。
 
+Task A 的全部八个采样时点均启用确定性失败告警。采样、Agent、Schema/Harness 校验或正式投递任一阶段未完成时，Harness 会向 Task A 专属群发送一条不依赖 Agent 卡片的告警 Post；若告警本身发送失败，它会以独立 pending notification 保留并由 Scheduler 自动恢复。
+
+Task A 的三次正式通知和失败告警均启用群聊回读：只有相同 `message_id` 在 Task A 目标群中可见后才记为 `sent`；已被飞书接受但暂时回读不到的消息保留 pending，恢复时不重复 POST。Scheduler 在 `11:20`、`15:01` 各自宽限 10 分钟后检查终态，并把缺失/失败记录写入 `logs/scheduler/health.jsonl` 后告警。
+
 正式通知使用 Feishu Card 2.0：Agent Memory 每日成功运行固定发送五张研究卡，选文先保证高质量与跨日去重，再优先近期，近期不足时按发布时间向历史回溯补满；每张首屏展示英文原题、中文译名和仅说明问题与方法的一句话概述，展开后先读论文摘要翻译，再按“现存问题—已有方法的不足—当前方法为什么可行—未来展望”深入浏览。A 股正常交易日使用“盘面总览—情绪与主线—异动与风险”三张渐进式市场卡。Apple 价格任务当前已停用且不会投递群消息。Agent Memory 卡片调研与取舍见 [论文速览卡片调研](docs/AGENT_MEMORY_PAPER_CARD_REVIEW.md)，A 股竞品调研与取舍见 [A 股分析产品复盘调研](docs/A_SHARE_COMPETITIVE_REVIEW.md)，实现与降级策略见 [飞书卡片投递](docs/FEISHU_CARDS.md)。
 
 新增功能和修复必须遵循 RED—GREEN—REFACTOR，并通过真实任务配置行为矩阵、Runner 临时状态集成测试和完整本地质量门禁，详见 [测试策略](docs/TEST_STRATEGY.md)。

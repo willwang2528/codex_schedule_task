@@ -9,11 +9,15 @@ launchd → generic scheduler → task.yaml + TASK.md
                               ↓
                        structured Codex Agent
                               ↓
-                 validate result + save outputs
+                strict Schema → correction retry
                               ↓
-                    atomic state transaction
+                 Harness semantic validation
                               ↓
-                 conditional idempotent delivery
+              atomic state + pending notification
+                              ↓
+              Feishu delivery → message readback
+                              ↓
+                slot monitor + independent log
 ```
 
 ## Responsibilities
@@ -35,11 +39,15 @@ launchd → generic scheduler → task.yaml + TASK.md
 2. `scripts/validate_task.py` validates schema, task isolation, and repository-relative paths.
 3. The Runner creates a deterministic run_id, serializes the task, and persists a recoverable `RUNNING` record.
 4. The Codex Agent receives the immutable business Prompt plus bounded relevant state and returns the strict schema in `config/task-result.schema.json`.
-5. The Harness validates status, notification fields, source freshness metadata, and proposed domain-state updates.
-6. JSON/Markdown outputs are saved under `outputs/<task-id>/<YYYY-MM-DD>/`.
-7. Valid non-failed domain state is merged and written with temp file + fsync + atomic rename. A failed result changes only operational retry metadata.
-8. `SUCCESS_NOTIFY` creates a stable pending notification before delivery. Card-profile tasks render semantic data into Feishu Card 2.0; every card receives its own deterministic UUID and is checkpointed after sending. Partial multi-card failure remains recoverable without rerunning the Agent.
-9. A timezone-aware JSONL run record is appended to `logs/<task-id>/`.
+5. The Runner validates the result against the same checked-in Schema locally, then the Harness validates status, notification fields, presentation, source metadata, task-owned state namespaces, and cross-field business rules. A rejected result receives exact JSON-pointer errors and one correction attempt.
+6. If the second result differs only by forbidden Harness-owned state operations, the Harness removes those operations, records a warning, and continues. It never repairs cards, market facts, or unknown namespaces.
+7. JSON/Markdown outputs are saved under `outputs/<task-id>/<YYYY-MM-DD>/`.
+8. Only a valid non-failed result can merge domain state. The update target is a strict operation list (`namespace`, `operation=upsert`, `value_json`); each task has an explicit namespace allowlist. State is written with temp file + fsync + atomic rename.
+9. `SUCCESS_NOTIFY` creates a stable pending notification before delivery. Card-profile tasks render semantic data into Feishu Card 2.0; every card receives its own deterministic UUID and is checkpointed after sending. Partial multi-card failure remains recoverable without rerunning the Agent.
+10. When readback is configured, a Feishu POST response is only delivery acceptance: the message remains pending until GET readback confirms the same `message_id` in the configured task chat. Recovery retries readback without resending an already accepted message.
+11. A failed slot with `delivery.failure_alert` enabled creates a separate deterministic Post alert before its delivery attempt. Alert delivery bypasses the business-notification time allowlist, has its own idempotency key, is never added to the business notification history or daily Pin archive, and remains pending if the alert channel is temporarily unavailable.
+12. After each configured notification grace period, the Scheduler requires a terminal `sent`, `pending`, or justified `SKIPPED` result. Missing, failed, or inconsistent runs produce an alert and an independent record in `logs/scheduler/health.jsonl`.
+13. A timezone-aware JSONL run record is appended to `logs/<task-id>/`.
 
 `run_task.py` and `scheduler.py` do not switch on task IDs. The existing deterministic smoke executor remains supported.
 
@@ -79,6 +87,12 @@ delivery:
   # notification_triggers: ["09:00"]
   # Optional best-effort group Pin archive for selected notification slots:
   # daily_archive: {"enabled": true, "trigger_slots": ["15:01"]}
+  # Optional deterministic failure alerts; values may include data-only slots:
+  # failure_alert: {"enabled": true, "trigger_slots": ["09:00", "15:00"]}
+  # Optional POST/GET verification in the configured task chat:
+  # readback: {"enabled": true, "trigger_slots": ["09:00"], "include_failure_alerts": true, "retry_attempts": 2}
+  # Optional post-grace terminal-state monitor; slots must also be notification-enabled and failure-alerted:
+  # completion_monitor: {"enabled": true, "trigger_slots": ["09:00"], "grace_minutes": 10}
   policy: conditional
   presentation: post
   retry_attempts: 2
@@ -90,6 +104,7 @@ output:
 state:
   enabled: true
   path: state/example-task.json
+  allowed_update_keys: ["example_domain_state"]
 
 logging:
   directory: logs/example-task
@@ -109,6 +124,9 @@ Every production record contains `task_id`, `run_id`, `scheduled_at`, `started_a
 
 - Agent/business failure: retain diagnostic output; do not merge proposed domain state.
 - Agent success and delivery failure: retain output and committed domain state; keep notification pending for recovery.
+- A message requiring readback is `sent` only after the exact message is found in the exact configured chat. An accepted but unreadable message keeps its `message_id` and pending state, so recovery does not duplicate it.
+- Configured failed slots create one sanitized failure alert. A failed alert remains independently pending and is retried without rerunning the Agent.
+- Notification-slot completion failures also append `logs/scheduler/health.jsonl`, so an outage in the Feishu path does not erase the local incident record.
 - No meaningful event is `SUCCESS_NO_NOTIFY`, not an error.
 - Non-trading day or other valid no-op is `SKIPPED`, not an error.
 - Deterministic smoke failure: persist observations, return non-zero, and log the error.

@@ -134,6 +134,48 @@ def _request_json(
     return result
 
 
+def _request_get_json(
+    url: str, *, bearer_token: str, timeout: int = 15
+) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_response = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            error_value = json.loads(exc.read().decode("utf-8", errors="replace"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            error_value = None
+        if isinstance(error_value, dict):
+            code = error_value.get("code")
+            message = _safe_api_message(
+                error_value.get("msg") or error_value.get("message")
+            )
+            if code is not None:
+                detail += f" code={code}"
+            if message:
+                detail += f" message={message}"
+        raise FeishuDeliveryError(
+            f"Feishu readback HTTP error: status={exc.code}{detail}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise FeishuDeliveryError(
+            f"Feishu readback network error: {exc.reason}"
+        ) from exc
+    try:
+        result = json.loads(raw_response)
+    except json.JSONDecodeError as exc:
+        raise FeishuDeliveryError("Feishu readback returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise FeishuDeliveryError("Feishu readback returned an unexpected response")
+    return result
+
+
 def _assert_public_https_url(url: str) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username:
@@ -372,6 +414,78 @@ def send_message(
         )
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     return {"status": "ok", "message_id": data.get("message_id")}
+
+
+def read_message(
+    message_id: str,
+    *,
+    chat_id: Optional[str] = None,
+    chat_id_env: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read back one sent message and verify that it exists in the target chat."""
+
+    normalized_message_id = str(message_id).strip()
+    if not normalized_message_id:
+        raise FeishuDeliveryError("readback message_id must be non-empty")
+    route_env_key = chat_id_env or CHAT_ID_ENV_KEY
+    if chat_id_env and not TASK_CHAT_ID_ENV_PATTERN.fullmatch(chat_id_env):
+        raise FeishuDeliveryError("chat_id_env is not an allowed task chat variable")
+    if not (
+        os.environ.get(APP_ID_ENV_KEY)
+        and os.environ.get(APP_SECRET_ENV_KEY)
+        and (chat_id or os.environ.get(route_env_key))
+    ):
+        load_local_feishu_env()
+    app_id = os.environ.get(APP_ID_ENV_KEY, "")
+    app_secret = os.environ.get(APP_SECRET_ENV_KEY, "")
+    expected_chat_id = chat_id or os.environ.get(route_env_key, "")
+    missing = [
+        key
+        for key, value in (
+            (APP_ID_ENV_KEY, app_id),
+            (APP_SECRET_ENV_KEY, app_secret),
+            (route_env_key, expected_chat_id),
+        )
+        if not value
+    ]
+    if missing:
+        raise FeishuDeliveryError(
+            "missing Feishu environment variables: " + ", ".join(missing)
+        )
+    tenant_token = _get_tenant_access_token(app_id, app_secret)
+    encoded_message_id = urllib.parse.quote(normalized_message_id, safe="")
+    result = _request_get_json(
+        f"{MESSAGE_URL}/{encoded_message_id}", bearer_token=tenant_token
+    )
+    if result.get("code") != 0:
+        raise FeishuDeliveryError(
+            f"Feishu readback failed: code={result.get('code')} "
+            f"message={_safe_api_message(result.get('msg', 'unknown'))}"
+        )
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    item = next(
+        (
+            value
+            for value in items
+            if isinstance(value, dict)
+            and value.get("message_id") == normalized_message_id
+        ),
+        None,
+    )
+    if item is None and data.get("message_id") == normalized_message_id:
+        item = data
+    if not isinstance(item, dict):
+        raise FeishuDeliveryError("Feishu readback did not return the sent message")
+    actual_chat_id = item.get("chat_id")
+    if actual_chat_id != expected_chat_id:
+        raise FeishuDeliveryError("Feishu readback message is not in the target chat")
+    return {
+        "status": "ok",
+        "message_id": normalized_message_id,
+        "chat_id": actual_chat_id,
+        "msg_type": item.get("msg_type"),
+    }
 
 
 def pin_message(message_id: str) -> Dict[str, Any]:

@@ -42,6 +42,16 @@ SECRET_KEY_MARKERS = ("secret", "password", "access_token", "private_key")
 TASK_CHAT_ID_ENV_PATTERN = re.compile(
     r"^FEISHU_CHAT_ID_[A-Z0-9_]+_SCHEDULE_TASK$"
 )
+STATE_UPDATE_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+RESERVED_STATE_UPDATE_KEYS = {
+    "_runtime",
+    "schema_version",
+    "task_id",
+    "state_version",
+    "last_run_at",
+    "last_success_at",
+    "notification_history",
+}
 
 
 class TaskConfigError(ValueError):
@@ -341,6 +351,50 @@ def validate_task_config(
         errors.append("output.save_local must be true or false")
     if not isinstance(_nested(config, "state", "enabled"), bool):
         errors.append("state.enabled must be true or false")
+    allowed_update_keys = _nested(config, "state", "allowed_update_keys")
+    if allowed_update_keys is not None:
+        if not isinstance(allowed_update_keys, list) or not allowed_update_keys:
+            errors.append("state.allowed_update_keys must be a non-empty inline list")
+        else:
+            normalized_update_keys = [str(value) for value in allowed_update_keys]
+            if any(
+                not STATE_UPDATE_KEY_PATTERN.fullmatch(value)
+                for value in normalized_update_keys
+            ):
+                errors.append(
+                    "state.allowed_update_keys values must use lower_snake_case"
+                )
+            if len(normalized_update_keys) != len(set(normalized_update_keys)):
+                errors.append("state.allowed_update_keys must not contain duplicates")
+            reserved_update_keys = sorted(
+                set(normalized_update_keys).intersection(RESERVED_STATE_UPDATE_KEYS)
+            )
+            if reserved_update_keys:
+                errors.append(
+                    "state.allowed_update_keys cannot contain Harness-owned keys: "
+                    + ", ".join(reserved_update_keys)
+                )
+            schema_path = repo_root / "config" / "task-result.schema.json"
+            try:
+                schema = json.loads(schema_path.read_text(encoding="utf-8"))
+                declared_namespaces = set(
+                    schema["properties"]["state_updates"]["items"]["properties"][
+                        "namespace"
+                    ]["enum"]
+                )
+            except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                errors.append(
+                    "config/task-result.schema.json must declare state update namespaces"
+                )
+            else:
+                undeclared_update_keys = sorted(
+                    set(normalized_update_keys).difference(declared_namespaces)
+                )
+                if undeclared_update_keys:
+                    errors.append(
+                        "state.allowed_update_keys must be declared in task-result schema: "
+                        + ", ".join(undeclared_update_keys)
+                    )
 
     delivery_policy = _nested(config, "delivery", "policy")
     if delivery_policy is not None and delivery_policy not in ALLOWED_DELIVERY_POLICIES:
@@ -429,6 +483,138 @@ def validate_task_config(
                         "delivery.daily_archive.trigger_slots must be a subset of delivery.notification_triggers: "
                         + ", ".join(unknown_archive_triggers)
                     )
+    failure_alert = _nested(config, "delivery", "failure_alert")
+    if failure_alert is not None:
+        if not isinstance(failure_alert, dict):
+            errors.append("delivery.failure_alert must be a mapping")
+        else:
+            alert_enabled = failure_alert.get("enabled")
+            if not isinstance(alert_enabled, bool):
+                errors.append("delivery.failure_alert.enabled must be true or false")
+            alert_triggers = failure_alert.get("trigger_slots")
+            if not isinstance(alert_triggers, list) or not alert_triggers:
+                errors.append(
+                    "delivery.failure_alert.trigger_slots must be a non-empty inline list"
+                )
+            else:
+                normalized_alert_triggers = [str(value) for value in alert_triggers]
+                if any(
+                    not TRIGGER_PATTERN.fullmatch(value)
+                    for value in normalized_alert_triggers
+                ):
+                    errors.append(
+                        "delivery.failure_alert.trigger_slots values must use HH:MM (24-hour time)"
+                    )
+                if len(normalized_alert_triggers) != len(
+                    set(normalized_alert_triggers)
+                ):
+                    errors.append(
+                        "delivery.failure_alert.trigger_slots must not contain duplicates"
+                    )
+                unknown_alert_triggers = sorted(
+                    set(normalized_alert_triggers).difference(schedule_triggers(config))
+                )
+                if unknown_alert_triggers:
+                    errors.append(
+                        "delivery.failure_alert.trigger_slots must be a subset of schedule.triggers: "
+                        + ", ".join(unknown_alert_triggers)
+                    )
+    readback = _nested(config, "delivery", "readback")
+    if readback is not None:
+        if not isinstance(readback, dict):
+            errors.append("delivery.readback must be a mapping")
+        else:
+            if not isinstance(readback.get("enabled"), bool):
+                errors.append("delivery.readback.enabled must be true or false")
+            readback_triggers = readback.get("trigger_slots")
+            if not isinstance(readback_triggers, list) or not readback_triggers:
+                errors.append(
+                    "delivery.readback.trigger_slots must be a non-empty inline list"
+                )
+            else:
+                normalized_readback = [str(value) for value in readback_triggers]
+                if any(
+                    not TRIGGER_PATTERN.fullmatch(value)
+                    for value in normalized_readback
+                ):
+                    errors.append(
+                        "delivery.readback.trigger_slots values must use HH:MM (24-hour time)"
+                    )
+                allowed_notifications = (
+                    {str(value) for value in notification_triggers}
+                    if isinstance(notification_triggers, list)
+                    else set(schedule_triggers(config))
+                )
+                unknown_readback = sorted(
+                    set(normalized_readback).difference(allowed_notifications)
+                )
+                if unknown_readback:
+                    errors.append(
+                        "delivery.readback.trigger_slots must be notification-enabled: "
+                        + ", ".join(unknown_readback)
+                    )
+            if (
+                "include_failure_alerts" in readback
+                and not isinstance(readback.get("include_failure_alerts"), bool)
+            ):
+                errors.append(
+                    "delivery.readback.include_failure_alerts must be true or false"
+                )
+            if not _positive_int(readback.get("retry_attempts", 1)):
+                errors.append("delivery.readback.retry_attempts must be a positive integer")
+    completion_monitor = _nested(config, "delivery", "completion_monitor")
+    if completion_monitor is not None:
+        if not isinstance(completion_monitor, dict):
+            errors.append("delivery.completion_monitor must be a mapping")
+        else:
+            if not isinstance(completion_monitor.get("enabled"), bool):
+                errors.append(
+                    "delivery.completion_monitor.enabled must be true or false"
+                )
+            monitor_triggers = completion_monitor.get("trigger_slots")
+            if not isinstance(monitor_triggers, list) or not monitor_triggers:
+                errors.append(
+                    "delivery.completion_monitor.trigger_slots must be a non-empty inline list"
+                )
+            else:
+                normalized_monitor = [str(value) for value in monitor_triggers]
+                if any(
+                    not TRIGGER_PATTERN.fullmatch(value)
+                    for value in normalized_monitor
+                ):
+                    errors.append(
+                        "delivery.completion_monitor.trigger_slots values must use HH:MM (24-hour time)"
+                    )
+                allowed_notifications = (
+                    {str(value) for value in notification_triggers}
+                    if isinstance(notification_triggers, list)
+                    else set(schedule_triggers(config))
+                )
+                unknown_monitor = sorted(
+                    set(normalized_monitor).difference(allowed_notifications)
+                )
+                if unknown_monitor:
+                    errors.append(
+                        "delivery.completion_monitor.trigger_slots must be notification-enabled: "
+                        + ", ".join(unknown_monitor)
+                    )
+                alert_trigger_values = (
+                    {str(value) for value in failure_alert.get("trigger_slots", [])}
+                    if isinstance(failure_alert, dict)
+                    else set()
+                )
+                missing_alerts = sorted(
+                    set(normalized_monitor).difference(alert_trigger_values)
+                )
+                if missing_alerts:
+                    errors.append(
+                        "delivery.completion_monitor.trigger_slots must have failure alerts: "
+                        + ", ".join(missing_alerts)
+                    )
+            if not _positive_int(completion_monitor.get("grace_minutes", 1)):
+                errors.append(
+                    "delivery.completion_monitor.grace_minutes must be a positive integer"
+                )
     delivery_retry = _nested(config, "delivery", "retry_attempts")
     if delivery_retry is not None and not _positive_int(delivery_retry):
         errors.append("delivery.retry_attempts must be a positive integer")
