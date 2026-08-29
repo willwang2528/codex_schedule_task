@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -286,6 +287,55 @@ def validate_task_config(
     catch_up_minutes = _nested(config, "schedule", "catch_up_minutes")
     if catch_up_minutes is not None and not _positive_int(catch_up_minutes):
         errors.append("schedule.catch_up_minutes must be a positive integer")
+    calendar = _nested(config, "schedule", "calendar")
+    if calendar is not None:
+        if not isinstance(calendar, dict):
+            errors.append("schedule.calendar must be a mapping")
+        else:
+            weekdays = calendar.get("weekdays")
+            if not isinstance(weekdays, list) or not weekdays:
+                errors.append(
+                    "schedule.calendar.weekdays must be a non-empty inline list"
+                )
+            else:
+                if any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 1 <= value <= 7
+                    for value in weekdays
+                ):
+                    errors.append(
+                        "schedule.calendar.weekdays must contain only integers from 1 to 7"
+                    )
+                if len(weekdays) != len(set(weekdays)):
+                    errors.append(
+                        "schedule.calendar.weekdays must not contain duplicates"
+                    )
+            closed_dates = calendar.get("closed_dates", [])
+            if not isinstance(closed_dates, list):
+                errors.append("schedule.calendar.closed_dates must be an inline list")
+            else:
+                valid_dates = True
+                for value in closed_dates:
+                    if not isinstance(value, str):
+                        valid_dates = False
+                        break
+                    try:
+                        parsed = date.fromisoformat(value)
+                    except ValueError:
+                        valid_dates = False
+                        break
+                    if parsed.isoformat() != value:
+                        valid_dates = False
+                        break
+                if not valid_dates:
+                    errors.append(
+                        "schedule.calendar.closed_dates values must use valid YYYY-MM-DD dates"
+                    )
+                if len(closed_dates) != len(set(closed_dates)):
+                    errors.append(
+                        "schedule.calendar.closed_dates must not contain duplicates"
+                    )
 
     workflow_type = _nested(config, "workflow", "type")
     if not isinstance(workflow_type, str) or not workflow_type.strip():

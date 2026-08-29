@@ -57,6 +57,7 @@ def discover_tasks(repo_root: Path) -> List[Dict[str, Any]]:
                 "enabled": bool(config["enabled"]),
                 "timezone": str(config["schedule"]["timezone"]),
                 "triggers": schedule_triggers(config),
+                "calendar": config["schedule"].get("calendar"),
                 "catch_up_minutes": int(
                     config["schedule"].get("catch_up_minutes", 15)
                 ),
@@ -67,6 +68,19 @@ def discover_tasks(repo_root: Path) -> List[Dict[str, Any]]:
     return tasks
 
 
+def _calendar_allows_date(task: Dict[str, Any], local_now: datetime) -> bool:
+    calendar = task.get("calendar")
+    if not isinstance(calendar, dict):
+        return True
+    weekdays = calendar.get("weekdays")
+    if isinstance(weekdays, list) and local_now.isoweekday() not in weekdays:
+        return False
+    closed_dates = calendar.get("closed_dates")
+    if not isinstance(closed_dates, list):
+        return True
+    return local_now.date().isoformat() not in closed_dates
+
+
 def due_runs(repo_root: Path, at: datetime) -> List[Dict[str, Any]]:
     due: List[Dict[str, Any]] = []
     for task in discover_tasks(repo_root):
@@ -74,6 +88,8 @@ def due_runs(repo_root: Path, at: datetime) -> List[Dict[str, Any]]:
             continue
         timezone = ZoneInfo(str(task["timezone"]))
         local_now = at.astimezone(timezone)
+        if not _calendar_allows_date(task, local_now):
+            continue
         for trigger in task["triggers"]:
             hour, minute = (int(part) for part in str(trigger).split(":"))
             scheduled = local_now.replace(
@@ -192,6 +208,9 @@ def run_once(
     monitoring: List[Dict[str, Any]] = []
     for task in tasks:
         if not task["enabled"]:
+            continue
+        timezone = ZoneInfo(str(task["timezone"]))
+        if not _calendar_allows_date(task, at.astimezone(timezone)):
             continue
         config_path = repo_root / str(task["config_path"])
         config = load_task_config(config_path)

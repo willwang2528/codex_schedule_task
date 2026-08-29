@@ -405,6 +405,53 @@ class RepositoryContractTests(unittest.TestCase):
             errors,
         )
 
+    def test_schedule_calendar_rejects_each_malformed_shape(self) -> None:
+        config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
+        base_config = load_task_config(config_path)
+        cases = (
+            ([], "schedule.calendar must be a mapping"),
+            (
+                {"weekdays": "1,2,3,4,5", "closed_dates": []},
+                "schedule.calendar.weekdays must be a non-empty inline list",
+            ),
+            (
+                {"weekdays": [], "closed_dates": []},
+                "schedule.calendar.weekdays must be a non-empty inline list",
+            ),
+            (
+                {"weekdays": [0, 1], "closed_dates": []},
+                "schedule.calendar.weekdays must contain only integers from 1 to 7",
+            ),
+            (
+                {"weekdays": [1, 1], "closed_dates": []},
+                "schedule.calendar.weekdays must not contain duplicates",
+            ),
+            (
+                {"weekdays": [1, 2, 3, 4, 5], "closed_dates": "2026-05-01"},
+                "schedule.calendar.closed_dates must be an inline list",
+            ),
+            (
+                {"weekdays": [1, 2, 3, 4, 5], "closed_dates": ["2026-02-30"]},
+                "schedule.calendar.closed_dates values must use valid YYYY-MM-DD dates",
+            ),
+            (
+                {
+                    "weekdays": [1, 2, 3, 4, 5],
+                    "closed_dates": ["2026-05-01", "2026-05-01"],
+                },
+                "schedule.calendar.closed_dates must not contain duplicates",
+            ),
+        )
+
+        for calendar_config, expected_error in cases:
+            with self.subTest(calendar_config=calendar_config):
+                config = copy.deepcopy(base_config)
+                config["schedule"]["calendar"] = calendar_config
+
+                errors = validate_task_config(config, config_path, REPO_ROOT)
+
+                self.assertIn(expected_error, errors)
+
     def test_task_state_namespaces_must_exist_in_result_schema(self) -> None:
         config_path = REPO_ROOT / "tasks" / "a-share-monitor" / "task.yaml"
         config = load_task_config(config_path)
@@ -497,13 +544,6 @@ class RepositoryContractTests(unittest.TestCase):
             self.assertEqual(["10:00"], tasks["apple-price-monitor"]["triggers"])
             self.assertEqual(["09:00"], tasks["agent-memory-frontier"]["triggers"])
 
-            weekend = datetime(
-                2026, 8, 22, 9, 20, tzinfo=ZoneInfo("Asia/Shanghai")
-            )
-            due = due_runs(isolated_root, weekend)
-            self.assertIn("a-share-monitor", {item["task"] for item in due})
-            self.assertNotIn("smoke-test", {item["task"] for item in due})
-
     def test_production_tasks_use_the_expected_card_profiles(self) -> None:
         expected = {
             "a-share-monitor": "market_dashboard_card",
@@ -530,6 +570,141 @@ class RepositoryContractTests(unittest.TestCase):
 
 
 class SchedulerRegressionTests(unittest.TestCase):
+    def test_a_share_monitor_is_not_due_on_weekends(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            copy_result_schema(repo)
+            (repo / "scripts").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "scripts" / "smoke_test.py",
+                repo / "scripts" / "smoke_test.py",
+            )
+            saturday = datetime(
+                2026, 8, 29, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+
+            due = due_runs(repo, saturday)
+
+        self.assertNotIn("a-share-monitor", {item["task"] for item in due})
+
+    def test_a_share_monitor_remains_due_on_regular_trading_days(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            copy_result_schema(repo)
+            (repo / "scripts").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "scripts" / "smoke_test.py",
+                repo / "scripts" / "smoke_test.py",
+            )
+            friday = datetime(
+                2026, 8, 28, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+
+            due = due_runs(repo, friday)
+
+        self.assertIn("a-share-monitor", {item["task"] for item in due})
+
+    def test_tasks_without_calendar_remain_due_on_weekends(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            copy_result_schema(repo)
+            (repo / "scripts").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "scripts" / "smoke_test.py",
+                repo / "scripts" / "smoke_test.py",
+            )
+            saturday = datetime(
+                2026, 8, 29, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+
+            due = due_runs(repo, saturday)
+
+        self.assertIn("agent-memory-frontier", {item["task"] for item in due})
+
+    def test_a_share_monitor_is_not_due_on_exchange_holidays(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            shutil.copytree(REPO_ROOT / "tasks", repo / "tasks")
+            copy_result_schema(repo)
+            (repo / "scripts").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "scripts" / "smoke_test.py",
+                repo / "scripts" / "smoke_test.py",
+            )
+            exchange_holidays = (
+                (2026, 1, 1),
+                (2026, 1, 2),
+                (2026, 2, 16),
+                (2026, 2, 17),
+                (2026, 2, 18),
+                (2026, 2, 19),
+                (2026, 2, 20),
+                (2026, 2, 23),
+                (2026, 4, 6),
+                (2026, 5, 1),
+                (2026, 5, 4),
+                (2026, 5, 5),
+                (2026, 6, 19),
+                (2026, 9, 25),
+                (2026, 10, 1),
+                (2026, 10, 2),
+                (2026, 10, 5),
+                (2026, 10, 6),
+                (2026, 10, 7),
+            )
+
+            for year, month, day in exchange_holidays:
+                with self.subTest(date=f"{year:04d}-{month:02d}-{day:02d}"):
+                    at = datetime(
+                        year,
+                        month,
+                        day,
+                        9,
+                        25,
+                        tzinfo=ZoneInfo("Asia/Shanghai"),
+                    )
+                    due = due_runs(repo, at)
+                    self.assertNotIn(
+                        "a-share-monitor", {item["task"] for item in due}
+                    )
+
+    def test_a_share_holiday_does_not_create_missing_run_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            task_root = repo / "tasks" / "a-share-monitor"
+            task_root.parent.mkdir(parents=True)
+            shutil.copytree(REPO_ROOT / "tasks" / "a-share-monitor", task_root)
+            copy_result_schema(repo)
+            (repo / "scripts").mkdir()
+            atomic_write_json(
+                repo / "state" / "a-share-monitor.json",
+                {"_runtime": {"processed_runs": {}, "notifications": {}}},
+            )
+            labour_day_after_grace = datetime(
+                2026, 5, 1, 11, 31, tzinfo=ZoneInfo("Asia/Shanghai")
+            )
+
+            with patch.object(production_runner, "send_message") as sender:
+                result = scheduler.run_once(
+                    repo,
+                    at=labour_day_after_grace,
+                    dry_run=False,
+                    recover_pending=True,
+                )
+
+            health_log_exists = (
+                repo / "logs" / "scheduler" / "health.jsonl"
+            ).exists()
+
+        self.assertEqual([], result["due"])
+        self.assertEqual([], result["monitoring"])
+        self.assertEqual(0, result["failed_count"])
+        self.assertFalse(sender.called)
+        self.assertFalse(health_log_exists)
+
     def test_pending_delivery_recovers_before_same_task_due_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory).resolve()
