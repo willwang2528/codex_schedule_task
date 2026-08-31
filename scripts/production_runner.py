@@ -115,6 +115,209 @@ def _safe_reserved_state_downgrade(
     return sanitized, warnings
 
 
+def _canonical_json_with_closed_containers(
+    source: str,
+    *,
+    allow_trailing_comma: bool = False,
+    allow_balanced: bool = False,
+) -> Optional[str]:
+    """Close open containers without inventing a key, string, or scalar value."""
+
+    source = source.strip()
+    if not source:
+        return None
+    removed_trailing_comma = allow_trailing_comma and source.endswith(",")
+    if removed_trailing_comma:
+        source = source[:-1].rstrip()
+        if not source:
+            return None
+    expected_closers: list[str] = []
+    in_string = False
+    escaped = False
+    for character in source:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            expected_closers.append("}")
+        elif character == "[":
+            expected_closers.append("]")
+        elif character in "}]":
+            if not expected_closers or expected_closers.pop() != character:
+                return None
+    if in_string or (not expected_closers and not allow_balanced):
+        return None
+    # Do not close after an unfinished scalar token, where doing so could change
+    # the value (for example, treating a truncated `1234` as `123`).
+    if (
+        not removed_trailing_comma
+        and source[-1] not in {'"', "}", "]"}
+        and not source.endswith(("true", "false", "null"))
+    ):
+        return None
+    candidate = source + "".join(reversed(expected_closers))
+    try:
+        recovered = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return json.dumps(recovered, ensure_ascii=False, separators=(",", ":"))
+
+
+def _json_with_missing_closing_delimiters(value_json: str) -> Optional[str]:
+    """Return canonical JSON when only closing object/array delimiters are missing."""
+
+    return _canonical_json_with_closed_containers(value_json)
+
+
+def _longest_complete_json_prefix(value_json: str) -> Optional[str]:
+    """Preserve the longest complete container prefix before a malformed tail."""
+
+    source = value_json.strip()
+    candidate_ends = {
+        index + 1
+        for index, character in enumerate(source)
+        if character in ",}]"
+    }
+    for end in sorted(candidate_ends, reverse=True):
+        if end >= len(source):
+            continue
+        candidate = _canonical_json_with_closed_containers(
+            source[:end],
+            allow_trailing_comma=True,
+            allow_balanced=True,
+        )
+        if candidate is None:
+            continue
+        recovered = json.loads(candidate)
+        if isinstance(recovered, (dict, list)) and recovered:
+            return candidate
+    return None
+
+
+def _safe_invalid_state_json_repair(
+    raw_result: Any, errors: list[Dict[str, str]]
+) -> tuple[Optional[Dict[str, Any]], list[Dict[str, str]]]:
+    """Repair state JSON only when the missing syntax is unambiguous."""
+
+    if not isinstance(raw_result, dict) or not errors:
+        return None, []
+    updates = raw_result.get("state_updates")
+    if not isinstance(updates, list):
+        return None, []
+    repaired_values: Dict[int, tuple[str, str, str]] = {}
+    for issue in errors:
+        path = issue.get("path", "")
+        parts = path.strip("/").split("/")
+        if (
+            issue.get("rule") != "invalid_json"
+            or len(parts) != 3
+            or parts[0] != "state_updates"
+            or parts[2] != "value_json"
+        ):
+            return None, []
+        try:
+            index = int(parts[1])
+            operation = updates[index]
+        except (IndexError, TypeError, ValueError):
+            return None, []
+        value_json = (
+            operation.get("value_json") if isinstance(operation, dict) else None
+        )
+        if not isinstance(value_json, str):
+            return None, []
+        try:
+            json.loads(value_json)
+        except json.JSONDecodeError:
+            repaired = _json_with_missing_closing_delimiters(value_json)
+            if repaired is not None:
+                repaired_values[index] = (
+                    repaired,
+                    "invalid_state_json_repaired",
+                    "Harness restored missing closing JSON delimiters after correction retry",
+                )
+                continue
+            recovered_prefix = _longest_complete_json_prefix(value_json)
+            if recovered_prefix is None:
+                return None, []
+            repaired_values[index] = (
+                recovered_prefix,
+                "invalid_state_json_partially_recovered",
+                "Harness discarded a malformed trailing JSON fragment and preserved its complete prefix",
+            )
+        else:
+            return None, []
+    if not repaired_values:
+        return None, []
+    sanitized = copy.deepcopy(raw_result)
+    for index, (repaired, _rule, _message) in repaired_values.items():
+        sanitized["state_updates"][index]["value_json"] = repaired
+    warnings = [
+        validation_issue(
+            f"/state_updates/{index}/value_json",
+            repaired_values[index][1],
+            repaired_values[index][2],
+        )
+        for index in sorted(repaired_values)
+    ]
+    return sanitized, warnings
+
+
+def _invalid_state_json_artifacts(
+    raw_result: Any,
+    recovered_result: Optional[Dict[str, Any]],
+    errors: list[Dict[str, str]],
+) -> list[Dict[str, str]]:
+    """Retain rejected state strings locally so recovery remains auditable."""
+
+    if not isinstance(raw_result, dict):
+        return []
+    updates = raw_result.get("state_updates")
+    recovered_updates = (
+        recovered_result.get("state_updates")
+        if isinstance(recovered_result, dict)
+        else None
+    )
+    if not isinstance(updates, list):
+        return []
+    artifacts: list[Dict[str, str]] = []
+    seen_indices: set[int] = set()
+    for issue in errors:
+        path = issue.get("path", "")
+        parts = path.strip("/").split("/")
+        if (
+            issue.get("rule") != "invalid_json"
+            or len(parts) != 3
+            or parts[0] != "state_updates"
+            or parts[2] != "value_json"
+        ):
+            continue
+        try:
+            index = int(parts[1])
+            original = updates[index]["value_json"]
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if index in seen_indices or not isinstance(original, str):
+            continue
+        seen_indices.add(index)
+        artifact = {"path": path, "original_value_json": original}
+        if isinstance(recovered_updates, list):
+            try:
+                recovered = recovered_updates[index]["value_json"]
+            except (IndexError, KeyError, TypeError):
+                recovered = None
+            if isinstance(recovered, str) and recovered != original:
+                artifact["recovered_value_json"] = recovered
+        artifacts.append(artifact)
+    return artifacts
+
+
 def _config_int(section: Dict[str, Any], key: str, default: int) -> int:
     value = section.get(key, default)
     return int(value) if isinstance(value, (int, float)) else default
@@ -141,6 +344,138 @@ def _failure_alert_enabled(
     return isinstance(trigger_slots, list) and trigger_slot in {
         str(value) for value in trigger_slots
     }
+
+
+def _self_repair_config(delivery_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    alert_config = delivery_config.get("failure_alert")
+    if not isinstance(alert_config, dict):
+        return None
+    repair_config = alert_config.get("self_repair")
+    if not isinstance(repair_config, dict) or repair_config.get("enabled") is not True:
+        return None
+    return repair_config
+
+
+def _queue_self_repair(
+    *,
+    repo_root: Path,
+    config: Dict[str, Any],
+    prompt_path: Path,
+    state_path: Path,
+    run_id: str,
+    scheduled_at: str,
+    trigger_slot: str,
+    failure_stage: str,
+    error: str,
+    output_json: str,
+    output_markdown: str,
+    alert: Dict[str, Any],
+    created_at: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Persist one repair request and launch its isolated background worker."""
+
+    repair_config = _self_repair_config(config.get("delivery", {}))
+    if repair_config is None:
+        return "not_configured", None, None
+    request_directory = repo_root / "logs" / "self-repair" / str(config["id"])
+    request_path = request_directory / f"{run_id}.request.json"
+    status_path = request_directory / f"{run_id}.status.json"
+    response_path = request_directory / f"{run_id}.response.md"
+    request_relative = str(request_path.relative_to(repo_root))
+    if request_path.is_file():
+        return "already_queued", request_relative, None
+
+    execution = config.get("execution") if isinstance(config.get("execution"), dict) else {}
+    timeout_seconds = _config_int(repair_config, "timeout_seconds", 7200)
+    request = {
+        "schema_version": 1,
+        "task_id": str(config["id"]),
+        "task_name": str(config["name"]),
+        "run_id": run_id,
+        "scheduled_at": scheduled_at,
+        "trigger_slot": trigger_slot,
+        "failure_stage": failure_stage,
+        "error": _sanitize_error(error),
+        "alert": {
+            "title": str(alert.get("title") or ""),
+            "body": str(alert.get("body") or ""),
+        },
+        "output_json": output_json,
+        "output_markdown": output_markdown,
+        "task_prompt": str(prompt_path.resolve().relative_to(repo_root.resolve())),
+        "state_path": str(state_path.resolve().relative_to(repo_root.resolve())),
+        "timeout_seconds": timeout_seconds,
+        "max_attempts": 1,
+        "model": str(execution.get("model") or ""),
+        "reasoning_effort": str(execution.get("reasoning_effort") or ""),
+        "status_path": str(status_path.relative_to(repo_root)),
+        "response_path": str(response_path.relative_to(repo_root)),
+        "created_at": created_at,
+    }
+    atomic_write_json(request_path, request)
+    atomic_write_json(
+        status_path,
+        {
+            "status": "queued",
+            "task_id": str(config["id"]),
+            "run_id": run_id,
+            "request": request_relative,
+            "updated_at": created_at,
+        },
+    )
+
+    worker_path = repo_root / "scripts" / "self_repair_agent.py"
+    if not worker_path.is_file():
+        launch_error = f"self-repair worker not found: {worker_path.relative_to(repo_root)}"
+        atomic_write_json(
+            status_path,
+            {
+                "status": "launch_failed",
+                "task_id": str(config["id"]),
+                "run_id": run_id,
+                "request": request_relative,
+                "error": launch_error,
+                "updated_at": created_at,
+            },
+        )
+        return "launch_failed", request_relative, launch_error
+
+    launcher_log = request_directory / f"{run_id}.launcher.log"
+    command = [
+        sys.executable,
+        str(worker_path),
+        "--repo-root",
+        str(repo_root),
+        "--request",
+        str(request_path),
+    ]
+    try:
+        with launcher_log.open("a", encoding="utf-8") as log_handle:
+            subprocess.Popen(
+                command,
+                cwd=repo_root,
+                env=_agent_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except OSError as exc:
+        launch_error = _sanitize_error(str(exc))
+        atomic_write_json(
+            status_path,
+            {
+                "status": "launch_failed",
+                "task_id": str(config["id"]),
+                "run_id": run_id,
+                "request": request_relative,
+                "error": launch_error,
+                "updated_at": created_at,
+            },
+        )
+        return "launch_failed", request_relative, launch_error
+    return "queued", request_relative, None
 
 
 def _ensure_failure_alert_pending(
@@ -905,6 +1240,9 @@ def monitor_scheduled_deliveries(
         alert_status = "not_configured"
         alert_error: Optional[str] = None
         fingerprint: Optional[str] = None
+        self_repair_status = "not_configured"
+        self_repair_request: Optional[str] = None
+        self_repair_error: Optional[str] = None
         if _failure_alert_enabled(delivery_config, trigger_slot):
             fingerprint = _ensure_failure_alert_pending(
                 task_id=str(config["id"]),
@@ -925,6 +1263,40 @@ def monitor_scheduled_deliveries(
             )
             atomic_write_json(state_path, state)
             alert_notification = notifications.get(fingerprint)
+            if _self_repair_config(delivery_config) is not None:
+                if dry_run_delivery:
+                    self_repair_status = "dry_run"
+                elif isinstance(alert_notification, dict):
+                    task_prompt_config = config.get("task_prompt")
+                    prompt_relative = (
+                        str(task_prompt_config.get("path"))
+                        if isinstance(task_prompt_config, dict)
+                        and task_prompt_config.get("path")
+                        else f"tasks/{config['id']}/TASK.md"
+                    )
+                    (
+                        self_repair_status,
+                        self_repair_request,
+                        self_repair_error,
+                    ) = _queue_self_repair(
+                        repo_root=repo_root,
+                        config=config,
+                        prompt_path=repo_root / prompt_relative,
+                        state_path=state_path,
+                        run_id=run_id,
+                        scheduled_at=scheduled_text,
+                        trigger_slot=trigger_slot,
+                        failure_stage="scheduler_completion_monitor",
+                        error=detail,
+                        output_json=str(prior.get("output_json") or "")
+                        if isinstance(prior, dict)
+                        else "",
+                        output_markdown=str(prior.get("output_markdown") or "")
+                        if isinstance(prior, dict)
+                        else "",
+                        alert=alert_notification,
+                        created_at=checked_at,
+                    )
             if (
                 isinstance(alert_notification, dict)
                 and alert_notification.get("status") == "sent"
@@ -962,6 +1334,9 @@ def monitor_scheduled_deliveries(
             "checked_at": checked_at,
             "trigger_slot": trigger_slot,
             "failure_alert_fingerprint": fingerprint,
+            "self_repair_status": self_repair_status,
+            "self_repair_request": self_repair_request,
+            "self_repair_error": self_repair_error,
         }
         atomic_write_json(state_path, state)
         incident = {
@@ -972,6 +1347,9 @@ def monitor_scheduled_deliveries(
             "reason": reason,
             "alert_status": alert_status,
             "alert_error": alert_error,
+            "self_repair_status": self_repair_status,
+            "self_repair_request": self_repair_request,
+            "self_repair_error": self_repair_error,
             "checked_at": checked_at,
         }
         incidents.append(incident)
@@ -1119,6 +1497,7 @@ def execute_production_task(
         )
 
         validation_warnings: list[Dict[str, str]] = []
+        validation_artifacts: list[Dict[str, str]] = []
         try:
             validation_attempts = 1 if result_file is not None else 2
             current_prompt = agent_prompt
@@ -1163,10 +1542,34 @@ def execute_production_task(
                         validate_result_schema(raw_result, schema_path)
                     if not notification_allowed:
                         raw_result = _suppress_result_notification(raw_result)
-                    result, state_updates = validate_agent_result(
-                        raw_result,
-                        allowed_state_update_keys=allowed_update_keys,
-                    )
+                    try:
+                        result, state_updates = validate_agent_result(
+                            raw_result,
+                            allowed_state_update_keys=allowed_update_keys,
+                        )
+                    except TaskValidationError as state_exc:
+                        if validation_attempt < validation_attempts:
+                            raise
+                        downgraded, downgrade_warnings = (
+                            _safe_invalid_state_json_repair(
+                                raw_result, state_exc.validation_errors
+                            )
+                        )
+                        validation_artifacts.extend(
+                            _invalid_state_json_artifacts(
+                                raw_result,
+                                downgraded,
+                                state_exc.validation_errors,
+                            )
+                        )
+                        if downgraded is None:
+                            raise
+                        raw_result = downgraded
+                        validation_warnings.extend(downgrade_warnings)
+                        result, state_updates = validate_agent_result(
+                            raw_result,
+                            allowed_state_update_keys=allowed_update_keys,
+                        )
                     if (
                         notification_allowed
                         and isinstance(
@@ -1255,6 +1658,7 @@ def execute_production_task(
             "trigger_slot": trigger_slot,
             "result": result,
             "validation_warnings": validation_warnings,
+            "validation_artifacts": validation_artifacts,
         }
         timestamp_slug = finished_at.strftime("%Y%m%dT%H%M%S%z")
         json_path, markdown_path = write_run_outputs(
@@ -1413,6 +1817,9 @@ def execute_production_task(
         failure_alert_status = "not_configured"
         failure_alert_error: Optional[str] = None
         failure_alert_fingerprint: Optional[str] = None
+        self_repair_status = "not_configured"
+        self_repair_request: Optional[str] = None
+        self_repair_error: Optional[str] = None
         if status == FAILED and _failure_alert_enabled(delivery_config, trigger_slot):
             failure_stage = (
                 "feishu_delivery"
@@ -1437,6 +1844,36 @@ def execute_production_task(
             if isinstance(failed_run, dict):
                 failed_run["failure_alert_fingerprint"] = failure_alert_fingerprint
             atomic_write_json(state_path, state)
+            _, notifications = _runtime_maps(state)
+            alert_notification = notifications.get(failure_alert_fingerprint)
+            if _self_repair_config(delivery_config) is not None:
+                if dry_run_delivery:
+                    self_repair_status = "dry_run"
+                elif isinstance(alert_notification, dict):
+                    (
+                        self_repair_status,
+                        self_repair_request,
+                        self_repair_error,
+                    ) = _queue_self_repair(
+                        repo_root=repo_root,
+                        config=config,
+                        prompt_path=prompt_path,
+                        state_path=state_path,
+                        run_id=run_id,
+                        scheduled_at=scheduled_at_text,
+                        trigger_slot=trigger_slot,
+                        failure_stage=failure_stage,
+                        error=delivery_error or str(result.get("error") or ""),
+                        output_json=str(json_path.relative_to(repo_root)),
+                        output_markdown=str(markdown_path.relative_to(repo_root)),
+                        alert=alert_notification,
+                        created_at=finished_at_text,
+                    )
+                if isinstance(failed_run, dict):
+                    failed_run["self_repair_status"] = self_repair_status
+                    failed_run["self_repair_request"] = self_repair_request
+                    failed_run["self_repair_error"] = self_repair_error
+                atomic_write_json(state_path, state)
             if (
                 delivery_config.get("enabled")
                 and delivery_config.get("type") == "feishu"
@@ -1472,6 +1909,9 @@ def execute_production_task(
                     "reason": "run_failed",
                     "alert_status": failure_alert_status,
                     "alert_error": failure_alert_error,
+                    "self_repair_status": self_repair_status,
+                    "self_repair_request": self_repair_request,
+                    "self_repair_error": self_repair_error,
                     "checked_at": now_in(timezone_name).isoformat(
                         timespec="seconds"
                     ),
@@ -1486,7 +1926,11 @@ def execute_production_task(
             "error": delivery_error,
             "failure_alert_status": failure_alert_status,
             "failure_alert_error": failure_alert_error,
+            "self_repair_status": self_repair_status,
+            "self_repair_request": self_repair_request,
+            "self_repair_error": self_repair_error,
             "validation_warnings": validation_warnings,
+            "validation_artifacts": validation_artifacts,
         }
         atomic_write_json(json_path, envelope)
         return {
@@ -1503,5 +1947,8 @@ def execute_production_task(
             "error": delivery_error,
             "failure_alert_status": failure_alert_status,
             "failure_alert_error": failure_alert_error,
+            "self_repair_status": self_repair_status,
+            "self_repair_request": self_repair_request,
+            "self_repair_error": self_repair_error,
             "validation_warnings": validation_warnings,
         }

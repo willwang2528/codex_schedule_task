@@ -24,11 +24,17 @@ ALLOWED_THEMES = {
     "indigo",
     "grey",
 }
-ALLOWED_TEMPLATES = {"research_item", "market_dashboard", "price_alert"}
+ALLOWED_TEMPLATES = {
+    "research_item",
+    "market_dashboard",
+    "price_alert",
+    "repo_digest",
+}
 PRESENTATION_RULES: Dict[str, Tuple[str, int, int]] = {
     "research_top5_cards": ("research_item", 5, 5),
     "market_dashboard_card": ("market_dashboard", 3, 3),
     "price_alert_cards": ("price_alert", 1, 5),
+    "repo_digest_card": ("repo_digest", 1, 1),
 }
 THEME_STYLE = {
     "blue": ("blue-50", "blue"),
@@ -48,6 +54,7 @@ TEMPLATE_ICONS = {
     "research_item": "myai_colorful",
     "market_dashboard": "chart_colorful",
     "price_alert": "notice_colorful",
+    "repo_digest": "myai_colorful",
 }
 PROFILE_INSTRUCTIONS = {
     "research_top5_cards": (
@@ -97,6 +104,18 @@ PROFILE_INSTRUCTIONS = {
         "is an exact checked offer or official storefront URL. Never merge materially "
         "different offer conditions into one card."
     ),
+    "repo_digest_card": (
+        "For SUCCESS_NOTIFY, notification.cards must contain exactly one repo_digest "
+        "card for the verified first repository on GitHub Trending daily. Use focus "
+        "value #1 and tag 今日榜首. Visible fields are labelled 榜单日期, 访问时间, "
+        "主要语言, and 当日新增 Star. Use exactly three ordered sections titled "
+        "一句话概括, 工作流, and 总结; only 一句话概括 is visible and the other two "
+        "are collapsed. The one-sentence overview states the background and problem "
+        "solved. 工作流 follows the verified input, core modules or control/data flow, "
+        "and output. 总结 covers value, intended users, maturity or adoption limits, "
+        "and explicitly says Trending 第一只代表当日关注动量，不等于质量认证. "
+        "source is the verified GitHub repository URL."
+    ),
 }
 
 RESEARCH_SECTION_TITLES = (
@@ -134,6 +153,13 @@ MARKET_ALLOWED_THEMES_BY_TAG = {
     "盘面总览": {"red", "green", "blue", "grey"},
     "情绪与主线": {"red", "green", "orange", "grey"},
     "异动与风险": {"yellow"},
+}
+REPO_DIGEST_SECTION_TITLES = ("一句话概括", "工作流", "总结")
+REPO_DIGEST_REQUIRED_FIELD_LABELS = {
+    "榜单日期",
+    "访问时间",
+    "主要语言",
+    "当日新增 Star",
 }
 
 # Card 2.0 component fields used by this renderer. Keep this allowlist aligned
@@ -494,6 +520,58 @@ def validate_presentation(
                 raise CardSpecError(
                     f"price_alert_cards card {index} supports at most three sections"
                 )
+    if presentation == "repo_digest_card":
+        card = cards[0]
+        if card["focus"]["value"].strip() != "#1":
+            raise CardSpecError("repo_digest_card focus value must be #1")
+        if card["tag"].strip() != "今日榜首":
+            raise CardSpecError("repo_digest_card tag must be 今日榜首")
+        sections = card["sections"]
+        titles = tuple(section["title"].strip() for section in sections)
+        if titles != REPO_DIGEST_SECTION_TITLES:
+            raise CardSpecError(
+                "repo_digest_card sections must be ordered as: "
+                + ", ".join(REPO_DIGEST_SECTION_TITLES)
+            )
+        if sections[0]["collapsed"] or any(
+            not section["collapsed"] for section in sections[1:]
+        ):
+            raise CardSpecError(
+                "repo_digest_card requires one visible overview and two collapsed sections"
+            )
+        overview = sections[0]["content"].strip()
+        if len(re.findall(r"[。！？!?]", overview)) != 1 or not re.search(
+            r"[。！？!?]$", overview
+        ):
+            raise CardSpecError(
+                "repo_digest_card overview must be exactly one sentence"
+            )
+        field_labels = {field["label"].strip() for field in card["fields"]}
+        if (
+            len(card["fields"]) != len(REPO_DIGEST_REQUIRED_FIELD_LABELS)
+            or field_labels != REPO_DIGEST_REQUIRED_FIELD_LABELS
+        ):
+            raise CardSpecError(
+                "repo_digest_card requires exactly the required four fields"
+            )
+        if "不等于质量认证" not in sections[2]["content"]:
+            raise CardSpecError(
+                "repo_digest_card summary must state Trending is not quality certification"
+            )
+        source_url = urlparse(card["source"]["url"])
+        if (
+            source_url.scheme != "https"
+            or source_url.hostname != "github.com"
+            or source_url.username
+            or source_url.query
+            or source_url.fragment
+            or not re.fullmatch(r"/[^/]+/[^/]+/?", source_url.path)
+        ):
+            raise CardSpecError(
+                "repo_digest_card source must be a verified GitHub repository URL"
+            )
+        if card["image_url"]:
+            raise CardSpecError("repo_digest_card image_url must be empty")
 
 
 def presentation_instruction(presentation: str) -> str:
@@ -670,7 +748,7 @@ def render_card(spec: Dict[str, Any], *, image_key: str = "") -> Dict[str, Any]:
         "text_size": "normal",
         "margin": "0px 0px 12px 0px",
     }
-    if card["template"] in {"research_item", "market_dashboard"}:
+    if card["template"] in {"research_item", "market_dashboard", "repo_digest"}:
         elements.extend((primary_block, focus_block))
     else:
         elements.extend((focus_block, primary_block))
@@ -693,7 +771,11 @@ def render_card(spec: Dict[str, Any], *, image_key: str = "") -> Dict[str, Any]:
                             else (
                                 "证据详情（点击展开/收起）"
                                 if card["template"] == "market_dashboard"
-                                else "详细数据（点击展开/收起）"
+                                else (
+                                    "项目详解（点击展开/收起）"
+                                    if card["template"] == "repo_digest"
+                                    else "详细数据（点击展开/收起）"
+                                )
                             )
                         ),
                     },

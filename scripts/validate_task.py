@@ -569,6 +569,28 @@ def validate_task_config(
                         "delivery.failure_alert.trigger_slots must be a subset of schedule.triggers: "
                         + ", ".join(unknown_alert_triggers)
                     )
+            self_repair = failure_alert.get("self_repair")
+            if self_repair is not None:
+                if not isinstance(self_repair, dict):
+                    errors.append(
+                        "delivery.failure_alert.self_repair must be a mapping"
+                    )
+                else:
+                    if not isinstance(self_repair.get("enabled"), bool):
+                        errors.append(
+                            "delivery.failure_alert.self_repair.enabled must be true or false"
+                        )
+                    elif (
+                        self_repair.get("enabled") is True
+                        and alert_enabled is not True
+                    ):
+                        errors.append(
+                            "delivery.failure_alert.self_repair requires delivery.failure_alert.enabled=true"
+                        )
+                    if not _positive_int(self_repair.get("timeout_seconds", 7200)):
+                        errors.append(
+                            "delivery.failure_alert.self_repair.timeout_seconds must be a positive integer"
+                        )
     readback = _nested(config, "delivery", "readback")
     if readback is not None:
         if not isinstance(readback, dict):

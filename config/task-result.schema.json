@@ -102,7 +102,12 @@
             "properties": {
               "template": {
                 "type": "string",
-                "enum": ["research_item", "market_dashboard", "price_alert"]
+                "enum": [
+                  "research_item",
+                  "market_dashboard",
+                  "price_alert",
+                  "repo_digest"
+                ]
               },
               "title": {"type": "string"},
               "subtitle": {"type": "string"},

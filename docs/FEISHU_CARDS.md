@@ -9,6 +9,7 @@ Automation Hub uses Feishu Card 2.0 for production notifications. The Agent retu
 | Agent Memory | `research_top5_cards` | Exactly five independent cards, one per ranked paper |
 | A-share monitor | `market_dashboard_card` | Exactly three cards: direction-colored overview, profit/loss-colored sentiment/mainline, yellow anomaly/risk |
 | Apple price monitor (disabled) | `price_alert_cards` | Task and delivery are disabled; retained only for possible future reactivation |
+| GitHub Repo of the Day | `repo_digest_card` | Exactly one project card: visible one-sentence positioning, collapsed workflow and conclusion, verified repository button |
 
 `SUCCESS_NO_NOTIFY` and `SKIPPED` always carry an empty card array and send nothing.
 
@@ -32,6 +33,8 @@ Each card contains:
 - an optional public HTTPS image URL
 
 The renderer applies Card 2.0 hierarchy, spacing, color, focus, grouping, truncation, dark/light-safe defaults, and a source button. Dynamic text is escaped so Agent output cannot inject mentions or card markup. Every rendered component is checked against a per-component field allowlist before delivery, preventing unsupported style properties from reaching the Feishu API.
+
+Standalone Codex automations can pass one semantic JSON object through `scripts/send_semantic_card.py`. The script validates the selected presentation, renders Card 2.0, sends with a stable idempotency key, persists the accepted `message_id` atomically, and reads it back from the configured chat. If readback fails, rerunning with the same card, key, and receipt retries only readback instead of sending another card.
 
 For the Agent Memory profile, the card header shows the exact original paper title and its Chinese translation. The first visible body section is `一句话概述`: one sentence based on the full text that states only the problem and method, without experimental data or result claims. The default-collapsed `论文详解` panel then starts with `论文摘要翻译`, followed by the existing sections `现存问题` → `已有方法的不足` → `当前方法为什么可行` → `未来展望`. Agent Memory relevance and selection rationale remain concise visible fields. This is a presentation contract only; candidate search, source verification, filtering, and Top 5 ranking are unchanged.
 

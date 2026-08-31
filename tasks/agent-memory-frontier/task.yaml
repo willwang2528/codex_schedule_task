@@ -25,6 +25,12 @@ delivery:
   type: feishu
   enabled: true
   target: configured_chat
+  failure_alert:
+    enabled: true
+    trigger_slots: ["09:00"]
+    self_repair:
+      enabled: true
+      timeout_seconds: 7200
   policy: always
   presentation: research_top5_cards
   retry_attempts: 2

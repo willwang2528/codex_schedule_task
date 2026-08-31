@@ -23,7 +23,7 @@ delivery:
   # Optional additive Pin archive; every value must also be notification-enabled.
   # daily_archive: {"enabled": true, "trigger_slots": ["15:01"]}
   # Optional deterministic failure alerts; values may include data-only slots.
-  # failure_alert: {"enabled": true, "trigger_slots": ["08:00"]}
+  # failure_alert: {"enabled": true, "trigger_slots": ["08:00"], "self_repair": {"enabled": true, "timeout_seconds": 7200}}
   # Optional POST/GET verification after send.
   # readback: {"enabled": true, "trigger_slots": ["08:00"], "include_failure_alerts": true, "retry_attempts": 2}
   # Optional completion monitor; slots must be notification-enabled and alerted.
