@@ -21,6 +21,13 @@ execution:
   retry_attempts: 2
   retry_backoff_seconds: 30
 
+github_sync:
+  enabled: true
+  directory: publications/agent-memory-frontier
+  remote: origin
+  branch: main
+  retry_attempts: 3
+
 delivery:
   type: feishu
   enabled: true

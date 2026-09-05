@@ -43,6 +43,8 @@ SECRET_KEY_MARKERS = ("secret", "password", "access_token", "private_key")
 TASK_CHAT_ID_ENV_PATTERN = re.compile(
     r"^FEISHU_CHAT_ID_[A-Z0-9_]+_SCHEDULE_TASK$"
 )
+GIT_REMOTE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+GIT_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 STATE_UPDATE_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 RESERVED_STATE_UPDATE_KEYS = {
     "_runtime",
@@ -260,6 +262,37 @@ def validate_task_config(
     for section in REQUIRED_SECTIONS:
         if not isinstance(config.get(section), dict):
             errors.append(f"{section} must be a mapping")
+
+    github_sync = config.get("github_sync")
+    if github_sync is not None:
+        if not isinstance(github_sync, dict):
+            errors.append("github_sync must be a mapping")
+        else:
+            if not isinstance(github_sync.get("enabled"), bool):
+                errors.append("github_sync.enabled must be true or false")
+            publication_directory = github_sync.get("directory")
+            if not isinstance(publication_directory, str) or not publication_directory.strip():
+                errors.append("github_sync.directory must be a non-empty relative path")
+            else:
+                publication_path = (repo_root / publication_directory).resolve()
+                publications_root = (repo_root / "publications").resolve()
+                if not _is_relative_to(publication_path, publications_root):
+                    errors.append("github_sync.directory must stay inside publications/")
+            remote = github_sync.get("remote")
+            if not isinstance(remote, str) or not GIT_REMOTE_PATTERN.fullmatch(remote):
+                errors.append("github_sync.remote must be a safe Git remote name")
+            branch = github_sync.get("branch")
+            if (
+                not isinstance(branch, str)
+                or not GIT_BRANCH_PATTERN.fullmatch(branch)
+                or ".." in branch
+                or "//" in branch
+                or branch.endswith(("/", "."))
+            ):
+                errors.append("github_sync.branch must be a safe Git branch name")
+            retry_attempts = github_sync.get("retry_attempts")
+            if not _positive_int(retry_attempts):
+                errors.append("github_sync.retry_attempts must be a positive integer")
 
     timezone_name = _nested(config, "schedule", "timezone")
     cron = _nested(config, "schedule", "cron")

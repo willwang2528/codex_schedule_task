@@ -127,10 +127,18 @@ def _has_pending_delivery(repo_root: Path, task: Dict[str, Any]) -> bool:
     state = read_json_object(state_path)
     runtime = state.get("_runtime")
     notifications = runtime.get("notifications") if isinstance(runtime, dict) else None
-    return isinstance(notifications, dict) and any(
+    has_pending_notification = isinstance(notifications, dict) and any(
         isinstance(value, dict) and value.get("status") == "pending"
         for value in notifications.values()
     )
+    publications = (
+        runtime.get("github_publications") if isinstance(runtime, dict) else None
+    )
+    has_pending_publication = isinstance(publications, dict) and any(
+        isinstance(value, dict) and value.get("status") == "pending"
+        for value in publications.values()
+    )
+    return has_pending_notification or has_pending_publication
 
 
 def _run_command(command: List[str], repo_root: Path) -> Dict[str, Any]:

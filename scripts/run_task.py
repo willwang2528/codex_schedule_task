@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import github_sync
 from production_runner import execute_production_task, recover_pending_delivery
 from task_runtime import (
     FAILED,
@@ -72,6 +73,43 @@ def _last_json_line(output: str) -> Optional[Dict[str, Any]]:
         if isinstance(value, dict):
             return value
     return None
+
+
+def _publish_production_result(
+    *,
+    repo_root: Path,
+    config: Dict[str, Any],
+    state_path: Path,
+    production_result: Dict[str, Any],
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    sync_config = config.get("github_sync")
+    if not isinstance(sync_config, dict) or sync_config.get("enabled") is not True:
+        return {"status": "disabled", "commit": None, "error": None}
+    if dry_run:
+        return {"status": "dry_run", "commit": None, "error": None}
+    if production_result.get("status") != "SUCCESS_NOTIFY":
+        return {"status": "skipped", "commit": None, "error": None}
+    output_json = production_result.get("output_json")
+    if not isinstance(output_json, str) or not output_json:
+        return {
+            "status": "failed",
+            "commit": None,
+            "error": "successful GitHub-enabled run has no finalized output_json",
+        }
+    try:
+        return github_sync.enqueue_and_publish(
+            repo_root=repo_root,
+            config=config,
+            state_path=state_path,
+            output_json=repo_root / output_json,
+        )
+    except (OSError, TaskRuntimeError) as exc:
+        return {
+            "status": "failed",
+            "commit": None,
+            "error": _sanitize_error(str(exc)),
+        }
 
 
 def main() -> int:
@@ -221,8 +259,36 @@ def main() -> int:
                 "failed": 1,
                 "error": _sanitize_error(str(exc)),
             }
+        if args.dry_run_delivery:
+            github_recovery = {
+                "status": "dry_run",
+                "recovered": 0,
+                "failed": 0,
+                "error": None,
+            }
+        else:
+            try:
+                github_recovery = github_sync.recover_pending_publications(
+                    repo_root=repo_root,
+                    config=config,
+                    state_path=state_path,
+                )
+            except (OSError, TaskRuntimeError) as exc:
+                github_recovery = {
+                    "status": "pending",
+                    "recovered": 0,
+                    "failed": 1,
+                    "error": _sanitize_error(str(exc)),
+                }
         ended = _now(timezone_name)
-        result = {**base_result, **recovery}
+        result = {
+            **base_result,
+            **recovery,
+            "github_sync_status": github_recovery["status"],
+            "github_sync_recovered": github_recovery["recovered"],
+            "github_sync_failed": github_recovery["failed"],
+            "github_sync_error": github_recovery.get("error"),
+        }
         _append_log(
             log_path,
             {
@@ -238,6 +304,10 @@ def main() -> int:
                 "delivery_status": "recovered" if recovery.get("recovered") else "none",
                 "output_path": None,
                 "error": recovery.get("error"),
+                "github_sync_status": github_recovery["status"],
+                "github_sync_recovered": github_recovery["recovered"],
+                "github_sync_failed": github_recovery["failed"],
+                "github_sync_error": github_recovery.get("error"),
             },
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -271,6 +341,19 @@ def main() -> int:
                 "output_markdown": None,
                 "error": _sanitize_error(str(exc)),
             }
+        github_publication = _publish_production_result(
+            repo_root=repo_root,
+            config=config,
+            state_path=state_path,
+            production_result=production_result,
+            dry_run=args.dry_run_delivery,
+        )
+        production_result["github_sync_status"] = github_publication["status"]
+        production_result["github_sync_commit"] = github_publication.get("commit")
+        production_result["github_sync_path"] = github_publication.get(
+            "publication_path"
+        )
+        production_result["github_sync_error"] = github_publication.get("error")
         ended = _now(timezone_name)
         result = {**base_result, **production_result}
         _append_log(
@@ -288,10 +371,17 @@ def main() -> int:
                 "delivery_status": production_result.get("delivery_status"),
                 "output_path": production_result.get("output_markdown"),
                 "error": production_result.get("error"),
+                "github_sync_status": production_result.get("github_sync_status"),
+                "github_sync_commit": production_result.get("github_sync_commit"),
+                "github_sync_path": production_result.get("github_sync_path"),
+                "github_sync_error": production_result.get("github_sync_error"),
             },
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        return 1 if production_result["status"] == FAILED else 0
+        return 1 if (
+            production_result["status"] == FAILED
+            or production_result.get("github_sync_status") == "failed"
+        ) else 0
 
     if args.prepare_only or not deterministic_script:
         ended = _now(timezone_name)
